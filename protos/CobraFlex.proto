@@ -1,0 +1,214 @@
+#VRML_SIM R2025a utf8
+
+PROTO CobraFlex [
+  # --- Позиция в мире ---
+  field SFVec3f    translation            0 0 0
+  field SFRotation rotation               0 1 0 0
+
+  # --- Корпус ---
+  field MFString   bodyMeshUrl            [ "meshes/robot_body.stl" ]
+  field SFVec3f    bodyScale              0.001 0.001 0.001
+  field SFColor    bodyColor              0.75 0.75 0.75
+  field SFVec3f    bodyBBoxSize           0.23 0.08 0.19
+  field SFVec3f    bodyVisualOffset       0 0.03 0
+
+  # --- Физика шасси ---
+  field SFFloat    mass                   3.5
+
+  # --- Колёса ---
+  field SFFloat    wheelRadius            0.035
+  field SFFloat    wheelWidth             0.020
+  field SFFloat    maxWheelVelocity       20.0
+  field SFFloat    maxWheelTorque         2.0
+
+  field MFString   wheelMeshUrl           [ "meshes/wheel_cobra.stl" ]
+  field SFVec3f    wheelMeshScale         0.001 0.001 0.001
+  field SFColor    wheelColor             0.1 0.1 0.1
+
+  # --- Якоря (X Y Z) ---
+  field SFVec3f    leftFrontAnchor        0.0773 0.035  0.082
+  field SFVec3f    leftRearAnchor        -0.0773 0.035  0.082
+  field SFVec3f    rightFrontAnchor       0.0773 0.035 -0.082
+  field SFVec3f    rightRearAnchor       -0.0773 0.035 -0.082
+
+  field SFString   controller             "udp_diff"
+] {
+  Robot {
+    supervisor  TRUE
+    translation IS translation
+    rotation    IS rotation
+    controller  IS controller
+
+    children [
+      # --- Корпус ---
+      Transform {
+        translation IS bodyVisualOffset
+        children [
+          Transform {
+            rotation 1 0 0 -1.5708
+            children [
+              Transform {
+                rotation 0 0 1 -1.5708
+                scale IS bodyScale
+                children [
+                  Shape {
+                    castShadows FALSE
+                    appearance Appearance { material Material { diffuseColor IS bodyColor } }
+                    geometry Mesh { url IS bodyMeshUrl }
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      }
+
+      # ===== LEFT FRONT =====
+      HingeJoint {
+        jointParameters HingeJointParameters { axis 0 0 1 anchor IS leftFrontAnchor }
+        device [
+          RotationalMotor { name "left_front_motor"  maxVelocity IS maxWheelVelocity maxTorque IS maxWheelTorque }
+          PositionSensor  { name "left_front_encoder" }
+        ]
+        endPoint Solid {
+          name "left_front_wheel"
+          translation IS leftFrontAnchor
+          children [
+            Transform {
+              rotation 1 0 0 -1.5708
+              scale IS wheelMeshScale
+              children [
+                Shape {
+                  castShadows FALSE
+                  appearance Appearance { material Material { diffuseColor IS wheelColor } }
+                  geometry Mesh { url IS wheelMeshUrl }
+                }
+              ]
+            }
+          ]
+          physics Physics { mass 0.08 density -1 }
+          boundingObject Cylinder { radius IS wheelRadius height IS wheelWidth }
+        }
+      }
+
+      # ===== LEFT REAR =====
+      HingeJoint {
+        jointParameters HingeJointParameters { axis 0 0 1 anchor IS leftRearAnchor }
+        device [
+          RotationalMotor { name "left_rear_motor"  maxVelocity IS maxWheelVelocity maxTorque IS maxWheelTorque }
+          PositionSensor  { name "left_rear_encoder" }
+        ]
+        endPoint Solid {
+          name "left_rear_wheel"
+          translation IS leftRearAnchor
+          children [
+            Transform {
+              rotation 1 0 0 -1.5708
+              scale IS wheelMeshScale
+              children [
+                Shape {
+                  castShadows FALSE
+                  appearance Appearance { material Material { diffuseColor IS wheelColor } }
+                  geometry Mesh { url IS wheelMeshUrl }
+                }
+              ]
+            }
+          ]
+          physics Physics { mass 0.08 density -1 }
+          boundingObject Cylinder { radius IS wheelRadius height IS wheelWidth }
+        }
+      }
+
+      # ===== RIGHT FRONT =====
+      HingeJoint {
+        jointParameters HingeJointParameters { axis 0 0 1 anchor IS rightFrontAnchor }
+        device [
+          RotationalMotor { name "right_front_motor" maxVelocity IS maxWheelVelocity maxTorque IS maxWheelTorque }
+          PositionSensor  { name "right_front_encoder" }
+        ]
+        endPoint Solid {
+          name "right_front_wheel"
+          translation IS rightFrontAnchor
+          children [
+            Transform {
+              rotation 1 0 0 1.5708
+              scale IS wheelMeshScale
+              children [
+                Shape {
+                  castShadows FALSE
+                  appearance Appearance { material Material { diffuseColor IS wheelColor } }
+                  geometry Mesh { url IS wheelMeshUrl }
+                }
+              ]
+            }
+          ]
+          physics Physics { mass 0.08 density -1 }
+          boundingObject Cylinder { radius IS wheelRadius height IS wheelWidth }
+        }
+      }
+
+      # ===== RIGHT REAR =====
+      HingeJoint {
+        jointParameters HingeJointParameters { axis 0 0 1 anchor IS rightRearAnchor }
+        device [
+          RotationalMotor { name "right_rear_motor"  maxVelocity IS maxWheelVelocity maxTorque IS maxWheelTorque }
+          PositionSensor  { name "right_rear_encoder" }
+        ]
+        endPoint Solid {
+          name "right_rear_wheel"
+          translation IS rightRearAnchor
+          children [
+            Transform {
+              rotation 1 0 0 1.5708
+              scale IS wheelMeshScale
+              children [
+                Shape {
+                  castShadows FALSE
+                  appearance Appearance { material Material { diffuseColor IS wheelColor } }
+                  geometry Mesh { url IS wheelMeshUrl }
+                }
+              ]
+            }
+          ]
+          physics Physics { mass 0.08 density -1 }
+          boundingObject Cylinder { radius IS wheelRadius height IS wheelWidth }
+        }
+      }
+
+      # ===== LIDAR =====
+      Transform {
+        translation 0.0 0.12 0
+        rotation 1 0 0 -1.5708
+        children [
+          Transform {
+            rotation 0 1 0 3.141592653589793
+            children [
+              Lidar {
+                name "lidar"
+                horizontalResolution 360
+                fieldOfView 1.5708
+                numberOfLayers 1
+                minRange 0.02
+                maxRange 8
+                defaultFrequency 15
+                noise 0.002
+              }
+            ]
+          }
+        ]
+      }
+
+      # --- Base sensors ---
+      GPS          { name "gps" }
+      InertialUnit { name "imu" }
+      Gyro         { name "gyro" }
+      Accelerometer{ name "acc" }
+    ]
+
+    physics Physics { mass IS mass density -1 }
+    boundingObject Transform {
+      translation 0 0.065 0
+      children [ Box { size IS bodyBBoxSize } ]
+    }
+  }
+}
