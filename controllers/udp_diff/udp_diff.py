@@ -32,7 +32,7 @@ TELEMETRY_PROTO = os.getenv("TELEMETRY_PROTO", "tcp").lower()
 TIME_STEP_MS = 32
 MAX_VEL = 12.0
 WHEEL_BASE = 0.12
-WHEEL_RADIUS = 0.03
+WHEEL_RADIUS = 0.035
 
 # Реалистичные ограничения движения
 MAX_LINEAR = 0.3       # м/с
