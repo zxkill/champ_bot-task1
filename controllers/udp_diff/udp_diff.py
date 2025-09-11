@@ -5,14 +5,14 @@ udp_diff — контроллер для Webots.
 - Принимает команды скоростей linear_x, angular_z по сети (UDP, порт 5555).
 - Управляет моторами робота через дифференциальное управление.
 - Считает одометрию по энкодерам.
-- Отправляет телеметрию (одометрия, GPS, lidar scan) по сети (TCP/UDP, порт 5600).
+- Отправляет телеметрию (одометрия, GPS, lidar scan, gyro) по сети (TCP/UDP, порт 5600).
 - Записывает результаты заезда (start/finish) в CSV-файл.
 - Ведёт лог состояния.
 - Включает стереокамеры и камеру глубины (stereo_left, stereo_right, depth_camera).
 
 Физические ограничения:
-- v ∈ [-0.3, 0.3] м/с
-- w ∈ [-1.0, 1.0] рад/с
+- v ∈ [-0.3, 0.3] м/с *SPEEDUP
+- w ∈ [-1.0, 1.0] рад/с *SPEEDUP
 - ограничение ускорений для плавного движения
 """
 
@@ -31,14 +31,23 @@ TELEMETRY_PROTO = os.getenv("TELEMETRY_PROTO", "tcp").lower()
 
 TIME_STEP_MS = 32
 MAX_VEL = 12.0
-WHEEL_BASE = 0.12
+WHEEL_BASE = 0.25
 WHEEL_RADIUS = 0.035
 
-# Реалистичные ограничения движения
-MAX_LINEAR = 0.3       # м/с
-MAX_ANGULAR = 1.0      # рад/с
-MAX_LINEAR_ACC = 0.05  # м/с²
-MAX_ANGULAR_ACC = 0.2  # рад/с²
+# УСКОРЕНИЕ
+SPEEDUP = int(os.getenv("SPEEDUP", "2"))
+
+# Реалистичные ограничения движения:
+BASE_MAX_LINEAR = 0.5  # м/с
+BASE_MAX_ANGULAR = 1.0  # рад/с
+BASE_MAX_LINEAR_ACC = 0.05  # м/с²
+BASE_MAX_ANGULAR_ACC = 0.2  # рад/с²
+
+# Ускоренные ограничения движения:
+MAX_LINEAR = BASE_MAX_LINEAR * SPEEDUP
+MAX_ANGULAR = BASE_MAX_ANGULAR * SPEEDUP
+MAX_LINEAR_ACC = BASE_MAX_LINEAR_ACC * SPEEDUP
+MAX_ANGULAR_ACC = BASE_MAX_ANGULAR_ACC * SPEEDUP
 
 # Тайминг старта/финиша
 ARENA = float(os.getenv("ARENA", "8"))
@@ -73,6 +82,7 @@ class UdpDiffController:
         # Датчики
         self.lidar = self._setup_lidar()
         self.gps = self._setup_gps()
+        self.gyro = self._setup_gyro()
 
         # Одометрия
         self.last_lf = self.last_lr = self.last_rf = self.last_rr = None
@@ -138,6 +148,15 @@ class UdpDiffController:
         except Exception:
             return None
 
+    def _setup_gyro(self):
+        try:
+            gyro = self.robot.getDevice("gyro")
+            gyro.enable(TIME_STEP_MS)
+            print("[udp_diff] gyro enabled")
+            return gyro
+        except Exception:
+            return None
+
     def _next_attempt(self, path):
         try:
             with open(path, "r", encoding="utf-8") as f:
@@ -146,9 +165,9 @@ class UdpDiffController:
         except Exception:
             return 1
 
-    def _write_result_csv(self, elapsed, start_t, finish_t, sx, sy, fx, fy):
+    def _write_result_csv(self, elapsed, start_t, finish_t, sx, sy, fx, fy, status: str = None):
         path = RESULTS_FILE
-        header = "timestamp_iso,attempt,elapsed_s,start_x,start_y,finish_x,finish_y,start_t,finish_t\n"
+        header = "timestamp_iso,attempt,elapsed_s,start_x,start_y,finish_x,finish_y,start_t,finish_t,status\n"
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         if not os.path.exists(path):
             with open(path, "w", encoding="utf-8", newline="") as f:
@@ -156,8 +175,9 @@ class UdpDiffController:
         attempt = self._next_attempt(path)
         ts = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(finish_t))
         with open(path, "a", encoding="utf-8", newline="") as f:
-            f.write(f"{ts},{attempt},{elapsed:.3f},{sx:.3f},{sy:.3f},{fx:.3f},{fy:.3f},{start_t:.3f},{finish_t:.3f}\n")
-        print(f"[udp_diff] saved result attempt={attempt} elapsed={elapsed:.3f}s → {path}")
+            f.write(
+                f"{ts},{attempt},{elapsed:.3f},{sx:.3f},{sy:.3f},{fx:.3f},{fy:.3f},{start_t:.3f},{finish_t:.3f},{status}\n")
+        print(f"[udp_diff] saved result attempt={attempt} elapsed={elapsed:.3f}s status={status} → {path}")
 
     # ================================================================
     # Сеть
@@ -286,6 +306,14 @@ class UdpDiffController:
                     # --- старт таймера: по реальному сдвигу (GPS) или по команде при отсутствии GPS ---
                     now = time.time()
 
+                # Gyro
+                wx = wy = wz = 0.0
+                if self.gyro:
+                    try:
+                        wx, wy, wz = self.gyro.getValues()
+                    except Exception:
+                        pass
+
                 if not self.started:
                     moved_cmd = (abs(linear_x) > START_CMD_V_THRESH) or (abs(angular_z) > START_CMD_W_THRESH)
                     moved_gps = False
@@ -308,7 +336,8 @@ class UdpDiffController:
                         self.finish_pos = (gx, gy)
                         elapsed = self.finish_time - self.start_time
                         sx, sy = self.start_pos if self.start_pos is not None else (gx, gy)
-                        self._write_result_csv(elapsed, self.start_time, self.finish_time, sx, sy, gx, gy)
+                        self._write_result_csv(elapsed, self.start_time, self.finish_time, sx, sy, gx, gy,
+                                               status="finish")
                         print(
                             f"[udp_diff] timing FINISH at t={self.finish_time:.3f}s ; elapsed={elapsed:.3f}s ; pos x={gx:.3f} y={gy:.3f}")
 
@@ -343,9 +372,11 @@ class UdpDiffController:
 
                 # Telemetry (no cameras)
                 n = len(ranges)
-                payload = b"WBT2" + struct.pack(
-                    "<6f", self.odom_x, self.odom_y, self.odom_th,
-                    self.current_v, 0.0, self.current_w
+                payload = b"WBTG" + struct.pack(  # b"WBT2" + struct.pack(
+                    "<9f",  # "<6f",
+                    self.odom_x, self.odom_y, self.odom_th,  # одометрия
+                    self.current_v, 0.0, self.current_w,  # скорости
+                    wx, wy, wz  # гироскоп
                 )
                 payload += struct.pack("<I", n)
                 if n:
@@ -369,8 +400,8 @@ class UdpDiffController:
                 if now - last_log > 1.0:
                     if ranges:
                         front = ranges[len(ranges) // 2]
-                        left = ranges[len(ranges) // 4]
-                        right = ranges[3 * len(ranges) // 4]
+                        right = ranges[len(ranges) // 4]
+                        left = ranges[3 * len(ranges) // 4]
                         lidar_info = f"n={n},front={front:.2f},left={left:.2f},right={right:.2f}"
                     else:
                         lidar_info = "n=0"
@@ -379,6 +410,7 @@ class UdpDiffController:
                         f"[udp_diff] ODOM(x={self.odom_x:.3f},y={self.odom_y:.3f},θ={math.degrees(self.odom_th):.1f}°) "
                         f"CMD(v={linear_x:.2f},w={angular_z:.2f}) "
                         f"LIDAR({lidar_info}) "
+                        f"Gyro: wx={wx:.3f}, wy={wy:.3f}, wz={wz:.3f} "
                         f"TX[{TELEMETRY_PROTO.upper()}→{TELEMETRY_HOST}:{TELEMETRY_PORT}]"
                     )
                     last_log = now
