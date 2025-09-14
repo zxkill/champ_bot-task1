@@ -1,13 +1,14 @@
 import math
+import os
 import socket
 import struct
 import time
 
-CMD_HOST = "127.0.0.1"
-CMD_PORT = 5555
-TEL_HOST = "127.0.0.1"
-TEL_PORT = 5600
-PROTO = "tcp"
+CMD_HOST  = str(os.getenv("CMD_HOST", "127.0.0.1"))
+CMD_PORT  = int(os.getenv("CMD_PORT", "5555"))
+TEL_HOST  = str(os.getenv("TEL_HOST", "0.0.0.0"))
+TEL_PORT  = int(os.getenv("TEL_PORT", "5600"))
+PROTO     = str(os.getenv("PROTO", "tcp"))
 
 # === Параметры ===
 SAFE_DIST = 0.5
@@ -43,6 +44,16 @@ def send_cmd(v: float, w: float):
     sock_cmd.sendto(packet, (CMD_HOST, CMD_PORT))
 
 
+def recv_all(sock, size):
+    buf = b""
+    while len(buf) < size:
+        chunk = sock.recv(size - len(buf))
+        if not chunk:
+            return None
+        buf += chunk
+    return buf
+
+
 def recv_tel():
     if PROTO == "udp":
         data, _ = sock_tel.recvfrom(65535)
@@ -51,7 +62,7 @@ def recv_tel():
         if not size_bytes:
             return None
         size = struct.unpack("<I", size_bytes)[0]
-        data = sock_tel.recv(size)
+        data = recv_all(sock_tel, size)
 
     if not data.startswith(b"WBTG"):  # ВНИМАНИЕ! Было: WBT2
         print('WBT2 -> WBTG')

@@ -1,0 +1,25 @@
+services:
+  demo-client:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: demo-client
+    ports:
+      - "5555:5555/udp"  # управление
+      - "5600:5600"      # телеметрия TCP/UDP
+    environment:
+      # адрес хоста, куда отправлять команды:
+      - CMD_HOST=host.docker.internal # для windows/mac
+      # - TEL_HOST=127.0.0.1            # linux
+      - CMD_PORT=5555
+
+      # адрес, на котором клиент слушает телеметрию:
+      - TEL_HOST=0.0.0.0              # для windows/mac
+      # - TEL_HOST=127.0.0.1            # linux
+
+      - TEL_PORT=5600
+      - PROTO=tcp
+    volumes:
+      - .:/app
+    working_dir: /app
+    command: python demo.py
