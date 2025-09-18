@@ -89,8 +89,20 @@ def corridor_fits(
     corridor: dict,
     required_width: float,
     min_forward_clearance: float = 0.35,
+    width_tolerance: float = 0.02,
 ) -> tuple[bool, dict | None]:
-    need = required_width
+    """Проверяем, проходит ли робот через конкретный коридор.
+
+    Возвращаемый план дополнительно содержит:
+      - ``requested_width`` — исходный запрос по ширине,
+      - ``width_margin`` — запас (может быть отрицательным, если задействована гистерезисная поблажка),
+      - ``width_tolerance`` — величина допустимого «недобора».
+    """
+
+    # Немного сдвигаем требуемую ширину вниз, чтобы гасить шум лидара.
+    # Даже при аккуратных измерениях ширина может «прыгать» на сантиметры,
+    # из-за чего коридор пропадает. Допускаем configurable запас.
+    need = max(0.0, required_width - max(0.0, width_tolerance))
     left = corridor["ang_left"]
     right = corridor["ang_right"]
     center = corridor["ang_center"]
@@ -109,6 +121,9 @@ def corridor_fits(
             "target_yaw_deg": center,
             "expected_width": width_best,
             "required_width": need,
+            "requested_width": required_width,
+            "width_margin": width_best - required_width,
+            "width_tolerance": width_tolerance,
         }
         return True, plan
     return False, None

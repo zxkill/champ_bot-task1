@@ -28,6 +28,7 @@ CRASH_DIST = 0.3
 RECOVER_TIME = 1               # время отката назад
 TURN_TIME = 0.6                # базовое время для поворота
 FORWARD_SPEED = 0.6            # м/с
+WIDTH_TOLERANCE = float(os.getenv("WIDTH_TOLERANCE", "0.02"))  # м — допустимое сужение коридора
 
 # demo.py (замени строку с from controllers.udp_diff.udp_diff import WHEEL_BASE ...)
 WHEEL_BASE   = float(os.getenv("WHEEL_BASE", "0.25"))
@@ -138,11 +139,20 @@ try:
             ok, plan = corridor_fits(
                 c,
                 required_width=required_width,
-                min_forward_clearance=min_forward_clearance
+                min_forward_clearance=min_forward_clearance,
+                width_tolerance=WIDTH_TOLERANCE,
             )
             if ok:
                 c["plan"] = plan
                 good.append(c)
+            else:
+                logger.debug(
+                    "Коридор %s отклонён: ширина %.2f м при запросе %.2f м, глубина %.2f м",
+                    (c["i0"], c["i1"]),
+                    c.get("width_at_best", float("nan")),
+                    required_width,
+                    c.get("depth_min", float("nan")),
+                )
 
         # Фиксируем реальное время шага, чтобы CorridorFollower мог правильно дозировать ускорения.
         current_time = time.time()
@@ -151,7 +161,13 @@ try:
 
         if good:
             best = max(good, key=lambda c: c["plan"]["expected_width"])
-            ctrl = follower.step(dt, ranges, best, best["plan"], best["plan"]["required_width"])
+            ctrl = follower.step(
+                dt,
+                ranges,
+                best,
+                best["plan"],
+                best["plan"]["requested_width"],
+            )
 
             send_cmd(ctrl["v"], ctrl["w"])
             logger.info(
