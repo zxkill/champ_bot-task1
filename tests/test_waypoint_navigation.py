@@ -100,6 +100,80 @@ def test_forward_motion_blocked_when_clearance_small(navigator, caplog):
     assert "Недостаточный зазор спереди" in caplog.text
 
 
+def test_dead_end_skip_advances_waypoint(navigator):
+    """Тупиковый фронт должен заставить навигатор пропустить текущую точку."""
+
+    navigator.update_pose(0.0, 0.0, 0.0)
+    navigator.update_scan([0.3, 0.3, 0.3, 0.3, 0.3])
+    command = navigator.step(0.1)
+
+    assert navigator.state.index == 1
+    assert command["target"] == pytest.approx((2.0, 0.0))
+    assert command["v"] == pytest.approx(0.0, abs=1e-6)
+
+
+def test_dead_end_skip_respects_limit(navigator):
+    """При нулевом лимите пропусков точка не должна перескакиваться автоматически."""
+
+    navigator.config.dead_end_max_skip = 0
+    navigator.update_pose(0.0, 0.0, 0.0)
+    navigator.update_scan([0.35, 0.34, 0.33, 0.34, 0.35])
+    command = navigator.step(0.1)
+
+    assert navigator.state.index == 0
+    assert command["target"] == pytest.approx((1.0, 0.0))
+
+
+def test_update_unwrapped_yaw_wraps_positive_delta(navigator):
+    """Переход через +pi должен корректно уменьшать прирост угла."""
+
+    navigator.state.prev_yaw = -3.0
+    navigator.state.yaw_unwrapped = -3.0
+    navigator._update_unwrapped_yaw(3.0)
+
+    expected = -3.0 + (3.0 - (-3.0) - 2 * math.pi)
+    assert navigator.state.yaw_unwrapped == pytest.approx(expected)
+
+
+def test_update_unwrapped_yaw_wraps_negative_delta(navigator):
+    """Переход через -pi также должен корректно добавлять 2*pi."""
+
+    navigator.state.prev_yaw = 3.0
+    navigator.state.yaw_unwrapped = 3.0
+    navigator._update_unwrapped_yaw(-3.0)
+
+    expected = 3.0 + (-3.0 - 3.0 + 2 * math.pi)
+    assert navigator.state.yaw_unwrapped == pytest.approx(expected)
+
+
+def test_blocked_rotation_tracker_initializes_missing_yaw(navigator):
+    """Если счётчик потерян, метод обязан восстановить базу и остановиться."""
+
+    navigator.state.blocked_yaw_last = None
+    navigator.state.yaw_unwrapped = 1.5
+    navigator.state.blocked_rotation_accum = 1.0
+    navigator._update_blocked_rotation_tracker(entering=False)
+
+    assert navigator.state.blocked_yaw_last == pytest.approx(1.5)
+    assert navigator.state.blocked_rotation_accum == pytest.approx(1.0)
+
+
+def test_release_without_ranges_logs_info(navigator, caplog):
+    """Отсутствие данных лидара должно приводить к мягкому снятию блокировки."""
+
+    navigator.config.dead_end_distance = 0.2
+    navigator.update_pose(0.0, 0.0, 0.0)
+    navigator.update_scan([0.35, 0.34, 0.33, 0.34, 0.35])
+    navigator.step(0.1)
+
+    navigator.update_scan([])
+    with caplog.at_level("INFO"):
+        command = navigator.step(0.1)
+
+    assert command["target"] == pytest.approx((1.0, 0.0))
+    assert "Снимаем блокировку без данных лидара" in caplog.text
+
+
 def test_blocked_turn_follows_fixed_direction(navigator):
     """При симметричных данных лидар робот обязан крутиться в заданную сторону."""
 

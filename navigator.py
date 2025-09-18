@@ -52,6 +52,9 @@ class NavigatorConfig:
     scan_full_rotation: float = 2.0 * math.pi  # предельный угол обзора: после полного оборота без коридора останавливаемся
     lidar_fov_deg: float = 45.0  # сектор обзора используемого лидара
     log_level: int = logging.INFO  # отдельный уровень логов навигатора
+    dead_end_distance: float = 0.45  # расстояние, при котором считаем фронт тупиковым и пропускаем точку
+    dead_end_yaw_threshold: float = math.radians(7.0)  # допустимая ошибка ориентации для классификации тупика
+    dead_end_max_skip: int = 3  # сколько подряд точек можно пропустить за один шаг
 
 
 @dataclass
@@ -188,6 +191,24 @@ class WaypointNavigator:
                 next_wp.speed,
             )
 
+    def _skip_dead_end_waypoint(self, range_min: float) -> None:
+        """Пропускает текущую точку маршрута, если обнаружен тупик."""
+
+        if self.state.index >= len(self._waypoints) - 1:
+            # Нечего пропускать — текущая точка уже последняя.
+            return
+
+        waypoint = self._waypoints[self.state.index]
+        self.logger.info(
+            "Перед роботом тупик: зазор %.2f м <= %.2f м — пропускаем точку %d (%.2f, %.2f)",
+            range_min,
+            self.config.dead_end_distance,
+            self.state.index,
+            waypoint.x,
+            waypoint.y,
+        )
+        self._advance_waypoint()
+
     # ------------------------------------------------------------------
     # Публичные методы для обновления состояния
     # ------------------------------------------------------------------
@@ -226,205 +247,202 @@ class WaypointNavigator:
         if dt <= 0.0:
             raise ValueError("Временной шаг должен быть положительным")
 
-        waypoint = self._current_waypoint()
-        if waypoint is None:
-            self.state.last_command = (0.0, 0.0)
-            return {"v": 0.0, "w": 0.0, "target": None, "range_min": self.state.last_range_min}
+        dead_end_skips = 0
+        range_min = math.inf
 
-        x, y, yaw = self.pose
-        dx = waypoint.x - x
-        dy = waypoint.y - y
-        distance = math.hypot(dx, dy)
-
-        if distance <= self.config.distance_threshold:
-            self.logger.info(
-                "Точка %d достигнута: расстояние %.3f м <= порога %.3f м",
-                self.state.index,
-                distance,
-                self.config.distance_threshold,
-            )
-            self._advance_waypoint()
+        while True:
             waypoint = self._current_waypoint()
             if waypoint is None:
                 self.state.last_command = (0.0, 0.0)
                 return {"v": 0.0, "w": 0.0, "target": None, "range_min": self.state.last_range_min}
+
+            x, y, yaw = self.pose
             dx = waypoint.x - x
             dy = waypoint.y - y
             distance = math.hypot(dx, dy)
 
-        desired_yaw = math.atan2(dy, dx)
-        yaw_error = self._wrap_angle(desired_yaw - yaw)
-
-        # Базовая угловая скорость — пропорциональный регулятор по углу.
-        w_base = self.config.angle_gain * yaw_error
-        w_base = max(-self.config.max_angular_speed, min(self.config.max_angular_speed, w_base))
-        # Текущая рабочая угловая скорость, которая будет корректироваться избежанием препятствий.
-        w_cmd = w_base
-
-        # Линейную скорость включаем только если робот почти смотрит на цель.
-        if abs(yaw_error) > self.config.in_place_turn_threshold or not self._ranges:
-            v_cmd = 0.0
-        else:
-            # Чем точнее наведён курс, тем быстрее едем.
-            heading_scale = max(0.0, math.cos(yaw_error))
-            base_speed = min(waypoint.speed, self.config.max_linear_speed)
-            v_cmd = base_speed * heading_scale
-
-        # Обработка данных лидара: минимальное расстояние и «отталкивание» от препятствий.
-        range_min = math.inf
-        avoidance = 0.0
-        avoidance_raw = 0.0
-        forward_blocked = False  # флаг: нельзя ехать вперёд из-за тесного прохода
-        was_blocked = self.state.blocked_steps > 0  # находились ли мы в режиме блокировки на предыдущем шаге
-        if was_blocked:
-            # Каждая итерация блокировки обновляет интегральный угол разворота.
-            self._update_blocked_rotation_tracker(entering=False)
-        left_min = math.inf  # минимальное расстояние в левой половине сектора
-        right_min = math.inf  # минимальное расстояние в правой половине сектора
-        if self._ranges:
-            n = len(self._ranges)
-            if n == 1:
-                angles = [0.0]
-            else:
-                start = -self.config.lidar_fov_deg / 2.0
-                step = self.config.lidar_fov_deg / (n - 1)
-                angles = [math.radians(start + i * step) for i in range(n)]
-
-            for ang, r in zip(angles, self._ranges):
-                range_min = min(range_min, r)
-                if r < self.config.avoidance_distance:
-                    weight = (self.config.avoidance_distance - r) / self.config.avoidance_distance
-                    if ang > 0.0:
-                        side = -1.0
-                    elif ang < 0.0:
-                        side = 1.0
-                    else:
-                        side = 0.0  # центральный луч не даёт подсказку по направлению
-                    avoidance_raw += side * weight
-                if ang > 0.0:
-                    left_min = min(left_min, r)
-                elif ang < 0.0:
-                    right_min = min(right_min, r)
-                else:
-                    # центральный луч обновляет оба значения, чтобы отразить фронтальную опасность
-                    left_min = min(left_min, r)
-                    right_min = min(right_min, r)
-
-            if range_min < self.config.hard_stop_distance:
-                self.logger.warning(
-                    "Препятствие слишком близко (%.2f м) — экстренно тормозим",
-                    range_min,
+            if distance <= self.config.distance_threshold:
+                self.logger.info(
+                    "Точка %d достигнута: расстояние %.3f м <= порога %.3f м",
+                    self.state.index,
+                    distance,
+                    self.config.distance_threshold,
                 )
+                self._advance_waypoint()
+                continue
+
+            desired_yaw = math.atan2(dy, dx)
+            yaw_error = self._wrap_angle(desired_yaw - yaw)
+
+            w_base = self.config.angle_gain * yaw_error
+            w_base = max(-self.config.max_angular_speed, min(self.config.max_angular_speed, w_base))
+            w_cmd = w_base
+
+            if abs(yaw_error) > self.config.in_place_turn_threshold or not self._ranges:
                 v_cmd = 0.0
-                forward_blocked = True
-            elif range_min < self.config.forward_clearance_distance:
-                # Перед роботом недостаточно места, безопаснее остаться на месте и повернуться.
-                if v_cmd > 0.0:
-                    v_cmd = 0.0
-                forward_blocked = True
-                if not was_blocked:
-                    # Логируем только момент входа в режим блокировки, чтобы не спамить сообщениями.
-                    self.logger.info(
-                        "Недостаточный зазор спереди: %.2f м < %.2f м — выполняем разворот на месте",
-                        range_min,
-                        self.config.forward_clearance_distance,
-                    )
-                else:
-                    # В режиме гистерезиса оставляем подробный отладочный след.
-                    self.logger.debug(
-                        "Продолжаем разворот: фронтальный зазор %.2f м по-прежнему ниже порога %.2f м",
-                        range_min,
-                        self.config.forward_clearance_distance,
-                    )
-            elif (
-                was_blocked
-                and range_min
-                < self.config.forward_clearance_distance + self.config.clearance_release_margin
-            ):
-                # Добавляем гистерезис: даже если зазор слегка вырос, продолжаем разворот,
-                # пока не появится устойчивый запас пространства.
-                if v_cmd > 0.0:
-                    v_cmd = 0.0
-                forward_blocked = True
-                self.logger.debug(
-                    "Удерживаем блокировку: зазор %.2f м меньше порога освобождения %.2f м",
-                    range_min,
-                    self.config.forward_clearance_distance + self.config.clearance_release_margin,
-                )
-            elif range_min < self.config.slowdown_distance and v_cmd > 0.0:
-                slowdown = max(0.0, min(1.0, range_min / self.config.slowdown_distance))
-                v_cmd = max(self.config.min_speed, v_cmd * slowdown)
-
-            avoidance = self.config.avoidance_gain * avoidance_raw
-            avoidance = max(
-                -self.config.avoidance_max_correction,
-                min(self.config.avoidance_max_correction, avoidance),
-            )
-            tentative_w = w_cmd + avoidance
-            # Если регулятор ориентации уверенно требует поворота (|ω| выше порога),
-            # избегание может лишь ослабить его, но не менять направление.
-            if (
-                abs(w_base) >= self.config.turn_priority_threshold
-                and w_base * tentative_w < 0.0
-            ):
-                w_cmd = w_base
-                self.logger.debug(
-                    "Избегание (%.3f рад/с) не меняет знак поворота, сохраняем w=%.3f",
-                    avoidance,
-                    w_cmd,
-                )
             else:
-                w_cmd = tentative_w
-            w_cmd = max(-self.config.max_angular_speed, min(self.config.max_angular_speed, w_cmd))
-        else:
+                heading_scale = max(0.0, math.cos(yaw_error))
+                base_speed = min(waypoint.speed, self.config.max_linear_speed)
+                v_cmd = base_speed * heading_scale
+
+            avoidance = 0.0
+            avoidance_raw = 0.0
+            forward_blocked = False
+            was_blocked = self.state.blocked_steps > 0
+            if was_blocked:
+                self._update_blocked_rotation_tracker(entering=False)
+            left_min = math.inf
+            right_min = math.inf
             range_min = math.inf
 
-        if forward_blocked:
-            # При блокировке вращаемся в фиксированную сторону, пока не увидим коридор
-            # или не выполним полный оборот без результата.
-            if not was_blocked:
-                self._update_blocked_rotation_tracker(entering=True)
-                self.state.blocked_scan_failed = False
-            self.state.blocked_steps += 1
+            if self._ranges:
+                n = len(self._ranges)
+                if n == 1:
+                    angles = [0.0]
+                else:
+                    start = -self.config.lidar_fov_deg / 2.0
+                    step = self.config.lidar_fov_deg / (n - 1)
+                    angles = [math.radians(start + i * step) for i in range(n)]
 
-            if not self.state.blocked_scan_failed:
-                w_cmd = self._resolve_blocked_turn_direction(w_cmd, yaw_error, left_min, right_min)
-                w_cmd = self._apply_blocked_turn_boost(w_cmd, yaw_error)
+                for ang, r in zip(angles, self._ranges):
+                    range_min = min(range_min, r)
+                    if r < self.config.avoidance_distance:
+                        weight = (self.config.avoidance_distance - r) / self.config.avoidance_distance
+                        if ang > 0.0:
+                            side = -1.0
+                        elif ang < 0.0:
+                            side = 1.0
+                        else:
+                            side = 0.0
+                        avoidance_raw += side * weight
+                    if ang > 0.0:
+                        left_min = min(left_min, r)
+                    elif ang < 0.0:
+                        right_min = min(right_min, r)
+                    else:
+                        left_min = min(left_min, r)
+                        right_min = min(right_min, r)
 
-                if self.state.blocked_rotation_accum >= self.config.scan_full_rotation:
-                    self.state.blocked_scan_failed = True
-                    self.logger.error(
-                        "Полный круг %.2f рад завершён без обнаружения коридора — остаёмся на месте",
-                        self.state.blocked_rotation_accum,
-                    )
-
-            if self.state.blocked_scan_failed:
-                v_cmd = 0.0
-                w_cmd = 0.0
-        else:
-            if was_blocked:
-                release_limit = (
-                    self.config.forward_clearance_distance
-                    + self.config.clearance_release_margin
-                )
-                if math.isfinite(range_min):
-                    self.logger.info(
-                        "Фронтальный проход очищен: минимальный зазор %.2f м превышает %.2f м, поворот %.2f рад",
+                if range_min < self.config.hard_stop_distance:
+                    self.logger.warning(
+                        "Препятствие слишком близко (%.2f м) — экстренно тормозим",
                         range_min,
-                        release_limit,
-                        self.state.blocked_rotation_accum,
+                    )
+                    v_cmd = 0.0
+                    forward_blocked = True
+                elif range_min < self.config.forward_clearance_distance:
+                    if v_cmd > 0.0:
+                        v_cmd = 0.0
+                    forward_blocked = True
+                    if not was_blocked:
+                        self.logger.info(
+                            "Недостаточный зазор спереди: %.2f м < %.2f м — выполняем разворот на месте",
+                            range_min,
+                            self.config.forward_clearance_distance,
+                        )
+                    else:
+                        self.logger.debug(
+                            "Продолжаем разворот: фронтальный зазор %.2f м по-прежнему ниже порога %.2f м",
+                            range_min,
+                            self.config.forward_clearance_distance,
+                        )
+                elif (
+                    was_blocked
+                    and range_min
+                    < self.config.forward_clearance_distance + self.config.clearance_release_margin
+                ):
+                    if v_cmd > 0.0:
+                        v_cmd = 0.0
+                    forward_blocked = True
+                    self.logger.debug(
+                        "Удерживаем блокировку: зазор %.2f м меньше порога освобождения %.2f м",
+                        range_min,
+                        self.config.forward_clearance_distance + self.config.clearance_release_margin,
+                    )
+                elif range_min < self.config.slowdown_distance and v_cmd > 0.0:
+                    slowdown = max(0.0, min(1.0, range_min / self.config.slowdown_distance))
+                    v_cmd = max(self.config.min_speed, v_cmd * slowdown)
+
+                avoidance = self.config.avoidance_gain * avoidance_raw
+                avoidance = max(
+                    -self.config.avoidance_max_correction,
+                    min(self.config.avoidance_max_correction, avoidance),
+                )
+                tentative_w = w_cmd + avoidance
+                if (
+                    abs(w_base) >= self.config.turn_priority_threshold
+                    and w_base * tentative_w < 0.0
+                ):
+                    w_cmd = w_base
+                    self.logger.debug(
+                        "Избегание (%.3f рад/с) не меняет знак поворота, сохраняем w=%.3f",
+                        avoidance,
+                        w_cmd,
                     )
                 else:
-                    self.logger.info(
-                        "Снимаем блокировку без данных лидара: поворот %.2f рад",
-                        self.state.blocked_rotation_accum,
+                    w_cmd = tentative_w
+                w_cmd = max(-self.config.max_angular_speed, min(self.config.max_angular_speed, w_cmd))
+
+            if (
+                math.isfinite(range_min)
+                and range_min <= self.config.dead_end_distance
+                and abs(yaw_error) <= self.config.dead_end_yaw_threshold
+            ):
+                if dead_end_skips < self.config.dead_end_max_skip:
+                    self._skip_dead_end_waypoint(range_min)
+                    dead_end_skips += 1
+                    continue
+                self.logger.warning(
+                    "Тупик %.2f м остаётся, но предел пропусков (%d) исчерпан — удерживаем текущую точку",
+                    range_min,
+                    self.config.dead_end_max_skip,
+                )
+
+            if forward_blocked:
+                if not was_blocked:
+                    self._update_blocked_rotation_tracker(entering=True)
+                    self.state.blocked_scan_failed = False
+                self.state.blocked_steps += 1
+
+                if not self.state.blocked_scan_failed:
+                    w_cmd = self._resolve_blocked_turn_direction(w_cmd, yaw_error, left_min, right_min)
+                    w_cmd = self._apply_blocked_turn_boost(w_cmd, yaw_error)
+
+                    if self.state.blocked_rotation_accum >= self.config.scan_full_rotation:
+                        self.state.blocked_scan_failed = True
+                        self.logger.error(
+                            "Полный круг %.2f рад завершён без обнаружения коридора — остаёмся на месте",
+                            self.state.blocked_rotation_accum,
+                        )
+
+                if self.state.blocked_scan_failed:
+                    v_cmd = 0.0
+                    w_cmd = 0.0
+            else:
+                if was_blocked:
+                    release_limit = (
+                        self.config.forward_clearance_distance
+                        + self.config.clearance_release_margin
                     )
-            # Как только проход устойчиво освобождён, забываем выбранное направление и счётчик.
-            self.state.blocked_steps = 0
-            self.state.blocked_turn_direction = None
-            self.state.blocked_yaw_last = None
-            self.state.blocked_rotation_accum = 0.0
-            self.state.blocked_scan_failed = False
+                    if math.isfinite(range_min):
+                        self.logger.info(
+                            "Фронтальный проход очищен: минимальный зазор %.2f м превышает %.2f м, поворот %.2f рад",
+                            range_min,
+                            release_limit,
+                            self.state.blocked_rotation_accum,
+                        )
+                    else:
+                        self.logger.info(
+                            "Снимаем блокировку без данных лидара: поворот %.2f рад",
+                            self.state.blocked_rotation_accum,
+                        )
+                self.state.blocked_steps = 0
+                self.state.blocked_turn_direction = None
+                self.state.blocked_yaw_last = None
+                self.state.blocked_rotation_accum = 0.0
+                self.state.blocked_scan_failed = False
+
+            break
 
         self.state.last_range_min = range_min
         self.state.last_command = (v_cmd, w_cmd)
@@ -448,7 +466,6 @@ class WaypointNavigator:
             "range_min": range_min,
             "yaw_error": yaw_error,
         }
-
     def _apply_blocked_turn_boost(self, w_cmd: float, yaw_error: float) -> float:
         """Увеличивает скорость разворота, когда фронтальный проход перекрыт.
 
