@@ -13,6 +13,7 @@ from tools import (
     _angles_deg,
     compute_required_gap_width,
     corridor_fits,
+    corridor_width_margin,
     find_corridors,
 )
 
@@ -41,14 +42,75 @@ def test_corridor_fits_filters_by_width():
 
     required_width = compute_required_gap_width(wheel_base=0.25, side_margin=0.05,
                                                 body_extra_each_side=0.02)
-    ok, plan = corridor_fits(corridor, required_width=required_width,
-                             min_forward_clearance=0.4)
+    ok, plan = corridor_fits(
+        corridor,
+        required_width=required_width,
+        min_forward_clearance=0.4,
+        width_tolerance=0.02,
+    )
     assert ok is True
-    assert plan["expected_width"] >= required_width
+    assert plan["expected_width"] >= plan["requested_width"]
+    assert plan["width_tolerance"] == pytest.approx(0.02)
+    assert plan["width_margin"] >= 0.0
 
     # Если запросить заведомо большую ширину, проход должен отвергаться
     too_wide, _ = corridor_fits(corridor, required_width=5.0, min_forward_clearance=0.4)
     assert too_wide is False
+
+
+def test_corridor_fits_tolerance_prevents_dropout():
+    """Небольшой запас по ширине должен спасать коридор от исчезновения."""
+    corridor = {
+        "ang_left": -30.0,
+        "ang_right": 30.0,
+        "ang_center": 0.0,
+        "depth_min": 0.31,
+    }
+    required_width = 0.37
+
+    ok_no_tol, plan_no_tol = corridor_fits(
+        corridor,
+        required_width=required_width,
+        min_forward_clearance=0.3,
+        width_tolerance=0.0,
+    )
+    assert ok_no_tol is False and plan_no_tol is None
+
+    ok_with_tol, plan_with_tol = corridor_fits(
+        corridor,
+        required_width=required_width,
+        min_forward_clearance=0.3,
+        width_tolerance=0.02,
+    )
+    assert ok_with_tol is True
+    assert plan_with_tol["width_margin"] == pytest.approx(-0.02, abs=1e-6)
+    assert plan_with_tol["requested_width"] == pytest.approx(required_width)
+
+
+def test_corridor_width_margin_identifies_near_miss_and_recovery():
+    """Функция должна показывать отрицательный, но ограниченный запас при узком проёме."""
+    corridor = {
+        "ang_left": -25.0,
+        "ang_right": 25.0,
+        "ang_center": 0.0,
+        "depth_min": 0.3,
+    }
+    required_width = 0.33
+    base_tol = 0.02
+
+    margin = corridor_width_margin(corridor, required_width, base_tol)
+    assert margin < 0.0
+    assert margin > -0.05
+
+    ok_recover, plan_recover = corridor_fits(
+        corridor,
+        required_width=required_width,
+        min_forward_clearance=0.25,
+        width_tolerance=base_tol + 0.04,
+    )
+    assert ok_recover is True
+    assert plan_recover["width_margin"] < 0.0
+    assert plan_recover["width_margin"] > -0.08
 
 
 @pytest.fixture()
@@ -63,7 +125,12 @@ def _make_corridor_plan(ranges):
                                min_points=3, min_depth_for_corridor=0.3)
     assert corridors, "должен быть найден хотя бы один коридор"
     corridor = corridors[0]
-    ok, plan = corridor_fits(corridor, required_width=0.35, min_forward_clearance=0.4)
+    ok, plan = corridor_fits(
+        corridor,
+        required_width=0.35,
+        min_forward_clearance=0.4,
+        width_tolerance=0.02,
+    )
     assert ok and plan
     corridor["plan"] = plan
     return corridor, plan
@@ -73,7 +140,7 @@ def test_corridor_follower_moves_forward_and_stays_straight(follower):
     """При широком проёме робот должен ехать прямо с равными угловыми скоростями колёс."""
     ranges = [1.5] * 21
     corridor, plan = _make_corridor_plan(ranges)
-    result = follower.step(0.1, ranges, corridor, plan, plan["required_width"])
+    result = follower.step(0.1, ranges, corridor, plan, plan["requested_width"])
     assert result["v"] > 0.0
     assert abs(result["w"]) < 1e-6
     assert math.isclose(result["w_left"], result["w_right"], rel_tol=1e-6)
@@ -84,7 +151,7 @@ def test_corridor_follower_emergency_brake_on_close_obstacle(follower):
     ranges_clear = [1.5] * 21
     corridor, plan = _make_corridor_plan(ranges_clear)
     # Разгоняемся на чистом участке
-    follower.step(0.1, ranges_clear, corridor, plan, plan["required_width"])
+    follower.step(0.1, ranges_clear, corridor, plan, plan["requested_width"])
     assert follower.v > 0.0
 
     # Теперь создаём препятствие непосредственно перед центром
@@ -93,8 +160,13 @@ def test_corridor_follower_emergency_brake_on_close_obstacle(follower):
     for offset in range(-2, 3):
         ranges_blocked[center + offset] = 0.15
     corridor_close, plan_close = _make_corridor_plan(ranges_clear)
-    result = follower.step(0.1, ranges_blocked, corridor_close, plan_close,
-                           plan_close["required_width"])
+    result = follower.step(
+        0.1,
+        ranges_blocked,
+        corridor_close,
+        plan_close,
+        plan_close["requested_width"],
+    )
     assert result["front_clear"] < 0.25
     assert result["v"] == pytest.approx(0.0, abs=1e-3)
 
@@ -104,7 +176,7 @@ def test_corridor_follower_rejects_non_positive_dt(follower):
     ranges = [1.5] * 21
     corridor, plan = _make_corridor_plan(ranges)
     with pytest.raises(ValueError):
-        follower.step(0.0, ranges, corridor, plan, plan["required_width"])
+        follower.step(0.0, ranges, corridor, plan, plan["requested_width"])
 
 
 def test_angles_and_sanitizing_edge_cases():
@@ -125,3 +197,6 @@ def test_angles_and_sanitizing_edge_cases():
     bad_geometry = {"ang_left": 0.0, "ang_right": 0.0, "ang_center": 0.0, "depth_min": 1.0}
     ok, plan = corridor_fits(bad_geometry, required_width=0.3, min_forward_clearance=0.2)
     assert not ok and plan is None
+
+    # corridor_width_margin должен консервативно реагировать на неполные данные.
+    assert corridor_width_margin({}, 0.3, 0.02) == float("-inf")

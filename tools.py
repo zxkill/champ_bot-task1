@@ -1,6 +1,13 @@
 import math
 from typing import List, Dict, Tuple, Optional
 
+
+# ---------------------------------------------------------------------------
+# Вспомогательные вычисления для коридоров.
+# Здесь сосредоточена математика, чтобы ею могли пользоваться и другие
+# компоненты (демо-клиент, тесты, возможно будущие модули).
+# ---------------------------------------------------------------------------
+
 def _angles_deg(n: int, fov_deg: float) -> List[float]:
     """Равномерные углы от -FOV/2 до +FOV/2 включительно."""
     if n <= 1:
@@ -89,8 +96,20 @@ def corridor_fits(
     corridor: dict,
     required_width: float,
     min_forward_clearance: float = 0.35,
+    width_tolerance: float = 0.02,
 ) -> tuple[bool, dict | None]:
-    need = required_width
+    """Проверяем, проходит ли робот через конкретный коридор.
+
+    Возвращаемый план дополнительно содержит:
+      - ``requested_width`` — исходный запрос по ширине,
+      - ``width_margin`` — запас (может быть отрицательным, если задействована гистерезисная поблажка),
+      - ``width_tolerance`` — величина допустимого «недобора».
+    """
+
+    # Немного сдвигаем требуемую ширину вниз, чтобы гасить шум лидара.
+    # Даже при аккуратных измерениях ширина может «прыгать» на сантиметры,
+    # из-за чего коридор пропадает. Допускаем configurable запас.
+    need = max(0.0, required_width - max(0.0, width_tolerance))
     left = corridor["ang_left"]
     right = corridor["ang_right"]
     center = corridor["ang_center"]
@@ -109,9 +128,43 @@ def corridor_fits(
             "target_yaw_deg": center,
             "expected_width": width_best,
             "required_width": need,
+            "requested_width": required_width,
+            "width_margin": width_best - required_width,
+            "width_tolerance": width_tolerance,
         }
         return True, plan
     return False, None
+
+
+def corridor_width_margin(
+    corridor: dict,
+    required_width: float,
+    width_tolerance: float,
+) -> float:
+    """Возвращает *запас* по ширине в текущем коридоре относительно требования.
+
+    Положительное значение означает, что коридор шире порога
+    (с учётом допущения ``width_tolerance``), отрицательное — что ширины не
+    хватает. Функция используется для более гибкой логики удержания коридора,
+    когда робот уже начал в него заходить.
+    """
+
+    need = max(0.0, required_width - max(0.0, width_tolerance))
+    left = corridor.get("ang_left")
+    right = corridor.get("ang_right")
+    dmax = corridor.get("depth_min")
+
+    if left is None or right is None or dmax is None:
+        # Если данных не хватает, считаем запас минимальным — так система
+        # будет консервативной и не позволит удерживать неопределённый коридор.
+        return float("-inf")
+
+    gap_tan = math.tan(math.radians(right)) - math.tan(math.radians(left))
+    if gap_tan <= 0.0 or dmax <= 0.0:
+        return float("-inf")
+
+    width_available = dmax * gap_tan
+    return width_available - need
 
 
 def compute_required_gap_width(

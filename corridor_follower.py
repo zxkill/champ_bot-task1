@@ -47,8 +47,9 @@ class CorridorFollower:
         :param dt: длительность шага дискретизации в секундах (должна быть > 0).
         :param ranges: массив дистанций лидара.
         :param corridor: описание выбранного сегмента из ``find_corridors``.
-        :param plan: результат ``corridor_fits`` с целевой глубиной и углом.
-        :param required_width: минимальная требуемая ширина проёма.
+        :param plan: результат ``corridor_fits`` с целевой глубиной, углом и полями
+            ``requested_width``/``width_margin``.
+        :param required_width: минимальная требуемая ширина проёма (исходный запрос).
         :return: словарь с командами ``v``, ``w`` и угловыми скоростями колёс.
         """
 
