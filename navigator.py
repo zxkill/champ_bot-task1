@@ -60,6 +60,7 @@ class NavigatorState:
     last_range_min: float = math.inf
     last_command: tuple[float, float] = field(default_factory=lambda: (0.0, 0.0))
     blocked_steps: int = 0  # количество последовательных шагов с заблокированным движением вперёд
+    blocked_turn_direction: Optional[float] = None  # выбранное направление разворота при блокировке
 
 
 class WaypointNavigator:
@@ -294,7 +295,9 @@ class WaypointNavigator:
             # Если вперёд идти нельзя, ускоряем поворот, чтобы быстрее освободить себе путь.
             w_cmd = self._apply_blocked_turn_boost(w_cmd, yaw_error)
         else:
+            # Как только проход освобождён, забываем выбранное направление и счётчик.
             self.state.blocked_steps = 0
+            self.state.blocked_turn_direction = None
 
         self.state.last_range_min = range_min
         self.state.last_command = (v_cmd, w_cmd)
@@ -373,27 +376,32 @@ class WaypointNavigator:
         left_space = left_min if math.isfinite(left_min) else self.config.avoidance_distance
         right_space = right_min if math.isfinite(right_min) else self.config.avoidance_distance
 
-        direction_seed = 0.0
-        decision_reason = ""
-
-        if abs(yaw_error) >= self.config.blocked_yaw_bias_threshold:
-            direction_seed = yaw_error
-            decision_reason = "yaw_error"
+        if self.state.blocked_turn_direction is not None:
+            direction = math.copysign(1.0, self.state.blocked_turn_direction)
+            decision_reason = "sticky"
         else:
-            # Положительная разница означает, что слева свободнее, отрицательная — справа.
-            space_delta = left_space - right_space
-            if abs(space_delta) >= self.config.blocked_direction_bias_threshold:
-                direction_seed = space_delta
-                decision_reason = "lidar_delta"
-            elif w_cmd != 0.0:
-                direction_seed = w_cmd
-                decision_reason = "existing_w"
-            else:
-                # Чередуем направления: нечётные шаги — влево, чётные — вправо.
-                direction_seed = 1.0 if (self.state.blocked_steps % 2 == 1) else -1.0
-                decision_reason = "alternating"
+            direction_seed = 0.0
+            decision_reason = ""
 
-        direction = math.copysign(1.0, direction_seed if direction_seed != 0.0 else 1.0)
+            if abs(yaw_error) >= self.config.blocked_yaw_bias_threshold:
+                direction_seed = yaw_error
+                decision_reason = "yaw_error"
+            else:
+                # Положительная разница означает, что слева свободнее, отрицательная — справа.
+                space_delta = left_space - right_space
+                if abs(space_delta) >= self.config.blocked_direction_bias_threshold:
+                    direction_seed = space_delta
+                    decision_reason = "lidar_delta"
+                elif w_cmd != 0.0:
+                    direction_seed = w_cmd
+                    decision_reason = "existing_w"
+                else:
+                    # Чередуем направления: нечётные шаги — влево, чётные — вправо.
+                    direction_seed = 1.0 if (self.state.blocked_steps % 2 == 1) else -1.0
+                    decision_reason = "alternating"
+
+            direction = math.copysign(1.0, direction_seed if direction_seed != 0.0 else 1.0)
+            self.state.blocked_turn_direction = direction
         # Небольшая ненулевая величина нужна, чтобы `_apply_blocked_turn_boost`
         # сохранил выбранный знак и не вернул дефолтное вращение влево.
         hint_magnitude = max(abs(w_cmd), 1e-3)

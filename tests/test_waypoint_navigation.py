@@ -146,28 +146,51 @@ def test_blocked_direction_prefers_wider_side(navigator):
     assert command["w"] > 0.0
 
 
-def test_blocked_direction_alternates_without_hints(navigator):
-    """При симметричном окружении направление должно чередоваться, чтобы робот не застревал."""
+def test_blocked_direction_uses_alternating_seed_once(navigator):
+    """Первое решение при симметрии должно зависеть от счётчика блокировок."""
 
     navigator.update_pose(0.0, 0.0, 0.0)
     navigator.update_scan([0.33, 0.33, 0.32, 0.33, 0.33])
 
     first = navigator.step(0.1)
+    assert first["w"] == pytest.approx(navigator.config.blocked_turn_speed)
+
+    # Сбрасываем скан, но оставляем блокировку — направление не должно меняться.
     navigator.update_scan([0.33, 0.33, 0.32, 0.33, 0.33])
     second = navigator.step(0.1)
 
-    assert first["w"] == pytest.approx(navigator.config.blocked_turn_speed)
-    assert second["w"] == pytest.approx(-navigator.config.blocked_turn_speed)
+    assert second["w"] == pytest.approx(navigator.config.blocked_turn_speed)
+    assert navigator.state.blocked_turn_direction == pytest.approx(1.0)
+
+
+def test_blocked_direction_stays_sticky_until_clear(navigator):
+    """Как только выбран знак разворота, он должен сохраняться до снятия блокировки."""
+
+    navigator.update_pose(0.0, 0.0, 0.0)
+    navigator.update_scan([0.33, 0.33, 0.32, 0.33, 0.33])
+
+    navigator.step(0.1)
+    navigator.update_scan([0.33, 0.33, 0.32, 0.33, 0.33])
+    navigator.step(0.1)
+
+    # Имитация освобождения прохода: большой зазор спереди.
+    navigator.update_scan([1.0, 1.0, 1.0, 1.0, 1.0])
+    navigator.step(0.1)
+
+    assert navigator.state.blocked_steps == 0
+    assert navigator.state.blocked_turn_direction is None
 
 
 def test_resolve_blocked_turn_uses_yaw_priority(navigator):
     """Вспомогательный метод должен отдавать приоритет курсовой ошибке при достаточном значении."""
 
     navigator.state.blocked_steps = 3
+    navigator.state.blocked_turn_direction = None
     decision = navigator._resolve_blocked_turn_direction(0.0, math.radians(20.0), 0.4, 0.4)
     assert decision > 0.0
 
     navigator.state.blocked_steps = 2
+    navigator.state.blocked_turn_direction = None
     decision_right = navigator._resolve_blocked_turn_direction(0.0, -math.radians(20.0), 0.4, 0.4)
     assert decision_right < 0.0
 
