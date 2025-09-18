@@ -44,6 +44,7 @@ class NavigatorConfig:
     min_speed: float = 0.05  # нижний предел положительной скорости при движении вперёд
     hard_stop_distance: float = 0.25  # абсолютный порог остановки при опасном сближении
     forward_clearance_distance: float = 0.35  # минимальный зазор перед роботом для разрешения движения вперёд
+    clearance_release_margin: float = 0.08  # дополнительный запас для выхода из режима блокировки (гистерезис)
     blocked_turn_speed: float = 1.2  # минимальная |ω|, когда стоим из-за недостаточного зазора
     blocked_direction_bias_threshold: float = 0.07  # насколько должен отличаться свободный простор слева/справа
     blocked_yaw_bias_threshold: float = math.radians(12.0)  # ошибка курса, при которой ей доверяем больше лидара
@@ -213,6 +214,7 @@ class WaypointNavigator:
         avoidance = 0.0
         avoidance_raw = 0.0
         forward_blocked = False  # флаг: нельзя ехать вперёд из-за тесного прохода
+        was_blocked = self.state.blocked_steps > 0  # находились ли мы в режиме блокировки на предыдущем шаге
         left_min = math.inf  # минимальное расстояние в левой половине сектора
         right_min = math.inf  # минимальное расстояние в правой половине сектора
         if self._ranges:
@@ -251,14 +253,39 @@ class WaypointNavigator:
                 )
                 v_cmd = 0.0
                 forward_blocked = True
-            elif range_min < self.config.forward_clearance_distance and v_cmd > 0.0:
+            elif range_min < self.config.forward_clearance_distance:
                 # Перед роботом недостаточно места, безопаснее остаться на месте и повернуться.
-                v_cmd = 0.0
+                if v_cmd > 0.0:
+                    v_cmd = 0.0
                 forward_blocked = True
-                self.logger.info(
-                    "Недостаточный зазор спереди: %.2f м < %.2f м — выполняем разворот на месте",
+                if not was_blocked:
+                    # Логируем только момент входа в режим блокировки, чтобы не спамить сообщениями.
+                    self.logger.info(
+                        "Недостаточный зазор спереди: %.2f м < %.2f м — выполняем разворот на месте",
+                        range_min,
+                        self.config.forward_clearance_distance,
+                    )
+                else:
+                    # В режиме гистерезиса оставляем подробный отладочный след.
+                    self.logger.debug(
+                        "Продолжаем разворот: фронтальный зазор %.2f м по-прежнему ниже порога %.2f м",
+                        range_min,
+                        self.config.forward_clearance_distance,
+                    )
+            elif (
+                was_blocked
+                and range_min
+                < self.config.forward_clearance_distance + self.config.clearance_release_margin
+            ):
+                # Добавляем гистерезис: даже если зазор слегка вырос, продолжаем разворот,
+                # пока не появится устойчивый запас пространства.
+                if v_cmd > 0.0:
+                    v_cmd = 0.0
+                forward_blocked = True
+                self.logger.debug(
+                    "Удерживаем блокировку: зазор %.2f м меньше порога освобождения %.2f м",
                     range_min,
-                    self.config.forward_clearance_distance,
+                    self.config.forward_clearance_distance + self.config.clearance_release_margin,
                 )
             elif range_min < self.config.slowdown_distance and v_cmd > 0.0:
                 slowdown = max(0.0, min(1.0, range_min / self.config.slowdown_distance))
@@ -295,7 +322,18 @@ class WaypointNavigator:
             # Если вперёд идти нельзя, ускоряем поворот, чтобы быстрее освободить себе путь.
             w_cmd = self._apply_blocked_turn_boost(w_cmd, yaw_error)
         else:
-            # Как только проход освобождён, забываем выбранное направление и счётчик.
+            if was_blocked and math.isfinite(range_min):
+                # Отмечаем момент выхода из блокировки для удобства анализа логов.
+                release_limit = (
+                    self.config.forward_clearance_distance
+                    + self.config.clearance_release_margin
+                )
+                self.logger.info(
+                    "Фронтальный проход очищен: минимальный зазор %.2f м превышает %.2f м",
+                    range_min,
+                    release_limit,
+                )
+            # Как только проход устойчиво освобождён, забываем выбранное направление и счётчик.
             self.state.blocked_steps = 0
             self.state.blocked_turn_direction = None
 

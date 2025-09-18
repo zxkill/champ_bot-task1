@@ -181,6 +181,33 @@ def test_blocked_direction_stays_sticky_until_clear(navigator):
     assert navigator.state.blocked_turn_direction is None
 
 
+def test_blocked_direction_waits_for_release_margin(navigator):
+    """Гистерезис должен удерживать блокировку, пока не появится дополнительный запас по дистанции."""
+
+    navigator.config.clearance_release_margin = 0.2
+    navigator.update_pose(0.0, 0.0, 0.0)
+
+    # Первый шаг с симметричным препятствием — фиксируем направление и блокировку.
+    navigator.update_scan([0.38, 0.36, 0.33, 0.36, 0.38])
+    first_command = navigator.step(0.1)
+    assert first_command["v"] == pytest.approx(0.0, abs=1e-6)
+    initial_turn = first_command["w"]
+
+    # Теперь фронтальный зазор слегка вырос, но не достиг лимита разблокировки — режим должен сохраниться.
+    navigator.update_scan([0.62, 0.6, 0.58, 0.6, 0.62])
+    second_command = navigator.step(0.1)
+    assert second_command["v"] == pytest.approx(0.0, abs=1e-6)
+    assert second_command["w"] == pytest.approx(initial_turn)
+    assert navigator.state.blocked_steps >= 2
+
+    # Когда появляется устойчивый запас, навигатор должен выйти из блокировки и забыть направление.
+    navigator.update_scan([0.9, 0.9, 0.9, 0.9, 0.9])
+    third_command = navigator.step(0.1)
+    assert third_command["v"] >= 0.0
+    assert navigator.state.blocked_steps == 0
+    assert navigator.state.blocked_turn_direction is None
+
+
 def test_resolve_blocked_turn_uses_yaw_priority(navigator):
     """Вспомогательный метод должен отдавать приоритет курсовой ошибке при достаточном значении."""
 
