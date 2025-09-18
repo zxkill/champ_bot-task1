@@ -5,6 +5,7 @@ import struct
 import time
 
 from tools import compute_required_gap_width, find_corridors, corridor_fits
+from corridor_follower import CorridorFollower
 
 CMD_HOST  = str(os.getenv("CMD_HOST", "127.0.0.1"))
 CMD_PORT  = int(os.getenv("CMD_PORT", "5555"))
@@ -100,6 +101,7 @@ def recv_tel():
 
 
 try:
+    follower = CorridorFollower(wheel_base=WHEEL_BASE, wheel_radius=WHEEL_RADIUS)
     while True:
         tel = recv_tel()
         if not tel:
@@ -126,6 +128,17 @@ try:
 
         if good:
             best = max(good, key=lambda c: c["plan"]["expected_width"])
+            # в цикле, когда у тебя уже есть best:
+            dt = 0.05  # или реальный dt твоего цикла
+            ctrl = follower.step(dt, ranges, best, best["plan"], best["plan"]["required_width"])
+
+            # теперь можно отправить либо (v, w), либо угловые скорости на моторы:
+            # пример: send_diff_velocity(ctrl["v"], ctrl["w"])  # если твой контроллер принимает v,w
+            # или:
+            # send_wheel_omegas(ctrl["w_left"], ctrl["w_right"])
+            print(f"[drive] v={ctrl['v']:.2f} m/s  w={ctrl['w']:.2f} rad/s  "
+                  f"ωL={ctrl['w_left']:.2f}  ωR={ctrl['w_right']:.2f}  "
+                  f"front≈{ctrl['front_clear']:.2f} m")
             print(
                 f"[corridor] ok: yaw={best['ang_center']:+.1f}° "
                 f"d*={best['plan']['target_depth']:.2f} m "
