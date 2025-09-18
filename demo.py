@@ -1,3 +1,6 @@
+"""Клиентский скрипт для автономного прохода через выбранный коридор."""
+
+import logging
 import math
 import os
 import socket
@@ -6,6 +9,12 @@ import time
 
 from tools import compute_required_gap_width, find_corridors, corridor_fits
 from corridor_follower import CorridorFollower
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(asctime)s] %(levelname)s %(name)s: %(message)s",
+)
+logger = logging.getLogger("corridor_demo")
 
 CMD_HOST  = str(os.getenv("CMD_HOST", "127.0.0.1"))
 CMD_PORT  = int(os.getenv("CMD_PORT", "5555"))
@@ -43,6 +52,7 @@ state_until = 0
 last_pos = None
 start_time = time.time()
 last_move_time = start_time
+last_control_time = start_time
 
 sock_cmd = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
@@ -101,7 +111,15 @@ def recv_tel():
 
 
 try:
-    follower = CorridorFollower(wheel_base=WHEEL_BASE, wheel_radius=WHEEL_RADIUS)
+    logger.info(
+        "Запускаем цикл управления: ожидаем телеметрию от контроллера на %s:%d",
+        TEL_HOST, TEL_PORT,
+    )
+    follower = CorridorFollower(
+        wheel_base=WHEEL_BASE,
+        wheel_radius=WHEEL_RADIUS,
+        logger=logging.getLogger("corridor_follower"),
+    )
     while True:
         tel = recv_tel()
         if not tel:
@@ -126,30 +144,30 @@ try:
                 c["plan"] = plan
                 good.append(c)
 
+        # Фиксируем реальное время шага, чтобы CorridorFollower мог правильно дозировать ускорения.
+        current_time = time.time()
+        dt = max(1e-3, current_time - last_control_time)
+        last_control_time = current_time
+
         if good:
             best = max(good, key=lambda c: c["plan"]["expected_width"])
-            # в цикле, когда у тебя уже есть best:
-            dt = 0.05  # или реальный dt твоего цикла
             ctrl = follower.step(dt, ranges, best, best["plan"], best["plan"]["required_width"])
 
-            # теперь можно отправить либо (v, w), либо угловые скорости на моторы:
-            # пример: send_diff_velocity(ctrl["v"], ctrl["w"])  # если твой контроллер принимает v,w
-            # или:
-            # send_wheel_omegas(ctrl["w_left"], ctrl["w_right"])
-            print(f"[drive] v={ctrl['v']:.2f} m/s  w={ctrl['w']:.2f} rad/s  "
-                  f"ωL={ctrl['w_left']:.2f}  ωR={ctrl['w_right']:.2f}  "
-                  f"front≈{ctrl['front_clear']:.2f} m")
-            print(
-                f"[corridor] ok: yaw={best['ang_center']:+.1f}° "
-                f"d*={best['plan']['target_depth']:.2f} m "
-                f"w≈{best['plan']['expected_width']:.2f} m "
-                f"(need≥{best['plan']['required_width']:.2f}) "
-                f"segment=[{best['i0']}-{best['i1']}]"
+            send_cmd(ctrl["v"], ctrl["w"])
+            logger.info(
+                "Коридор %s, ширина %.2f м, глубина %.2f м -> команды: v=%.2f м/с, w=%.2f рад/с",
+                (best["i0"], best["i1"]),
+                best["plan"]["expected_width"],
+                best["plan"]["target_depth"],
+                ctrl["v"],
+                ctrl["w"],
             )
         else:
-            print("[corridor] no suitable corridor")
+            # Без безопасного коридора лучше остановиться и пересчитать план.
+            send_cmd(0.0, 0.0)
+            logger.warning("Подходящих коридоров не найдено — стоим на месте")
 
-        now = time.time()
+        now = current_time
 
         # проверка движения (анти-застревание по одометрии)
         # if last_pos is not None:
@@ -206,5 +224,8 @@ try:
 
 
 except KeyboardInterrupt:
-    print("[client] stop")
+    logger.info("Получен Ctrl+C — завершаем работу")
+    send_cmd(0.0, 0.0)
+finally:
+    # Гарантируем, что после выхода из скрипта робот не продолжит движение.
     send_cmd(0.0, 0.0)
