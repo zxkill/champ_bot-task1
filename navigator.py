@@ -45,6 +45,8 @@ class NavigatorConfig:
     hard_stop_distance: float = 0.25  # абсолютный порог остановки при опасном сближении
     forward_clearance_distance: float = 0.35  # минимальный зазор перед роботом для разрешения движения вперёд
     blocked_turn_speed: float = 1.2  # минимальная |ω|, когда стоим из-за недостаточного зазора
+    blocked_direction_bias_threshold: float = 0.07  # насколько должен отличаться свободный простор слева/справа
+    blocked_yaw_bias_threshold: float = math.radians(12.0)  # ошибка курса, при которой ей доверяем больше лидара
     lidar_fov_deg: float = 45.0  # сектор обзора используемого лидара
     log_level: int = logging.INFO  # отдельный уровень логов навигатора
 
@@ -57,6 +59,7 @@ class NavigatorState:
     finished: bool = False
     last_range_min: float = math.inf
     last_command: tuple[float, float] = field(default_factory=lambda: (0.0, 0.0))
+    blocked_steps: int = 0  # количество последовательных шагов с заблокированным движением вперёд
 
 
 class WaypointNavigator:
@@ -209,6 +212,8 @@ class WaypointNavigator:
         avoidance = 0.0
         avoidance_raw = 0.0
         forward_blocked = False  # флаг: нельзя ехать вперёд из-за тесного прохода
+        left_min = math.inf  # минимальное расстояние в левой половине сектора
+        right_min = math.inf  # минимальное расстояние в правой половине сектора
         if self._ranges:
             n = len(self._ranges)
             if n == 1:
@@ -222,8 +227,21 @@ class WaypointNavigator:
                 range_min = min(range_min, r)
                 if r < self.config.avoidance_distance:
                     weight = (self.config.avoidance_distance - r) / self.config.avoidance_distance
-                    side = -1.0 if ang > 0 else 1.0
+                    if ang > 0.0:
+                        side = -1.0
+                    elif ang < 0.0:
+                        side = 1.0
+                    else:
+                        side = 0.0  # центральный луч не даёт подсказку по направлению
                     avoidance_raw += side * weight
+                if ang > 0.0:
+                    left_min = min(left_min, r)
+                elif ang < 0.0:
+                    right_min = min(right_min, r)
+                else:
+                    # центральный луч обновляет оба значения, чтобы отразить фронтальную опасность
+                    left_min = min(left_min, r)
+                    right_min = min(right_min, r)
 
             if range_min < self.config.hard_stop_distance:
                 self.logger.warning(
@@ -270,8 +288,13 @@ class WaypointNavigator:
             range_min = math.inf
 
         if forward_blocked:
+            # При блокировке выбираем сторону разворота, опираясь на данные лидара и историю.
+            self.state.blocked_steps += 1
+            w_cmd = self._resolve_blocked_turn_direction(w_cmd, yaw_error, left_min, right_min)
             # Если вперёд идти нельзя, ускоряем поворот, чтобы быстрее освободить себе путь.
             w_cmd = self._apply_blocked_turn_boost(w_cmd, yaw_error)
+        else:
+            self.state.blocked_steps = 0
 
         self.state.last_range_min = range_min
         self.state.last_command = (v_cmd, w_cmd)
@@ -325,3 +348,65 @@ class WaypointNavigator:
             w_cmd = boosted
 
         return max(-self.config.max_angular_speed, min(self.config.max_angular_speed, w_cmd))
+
+    def _resolve_blocked_turn_direction(
+        self,
+        w_cmd: float,
+        yaw_error: float,
+        left_min: float,
+        right_min: float,
+    ) -> float:
+        """Выбирает приоритетное направление разворота, когда движение вперёд запрещено.
+
+        Алгоритм действует по ступеням, чтобы минимизировать время простоя:
+        1. Если ошибка курса заметная, доверяем ей — значит, целевая точка
+           явно сбоку.
+        2. Если ошибка мала, но лидар показывает, что слева или справа
+           заметно больше пространства, используем это.
+        3. Если и это не помогает, берём знак текущей угловой скорости,
+           чтобы не менять решение в каждой итерации.
+        4. В последнюю очередь чередуем направления при симметрии, чтобы
+           «прощупать» оба варианта и не застревать у стены.
+        """
+
+        # Подготовим безопасные значения для анализа: если лучей нет, считаем что пространство свободно.
+        left_space = left_min if math.isfinite(left_min) else self.config.avoidance_distance
+        right_space = right_min if math.isfinite(right_min) else self.config.avoidance_distance
+
+        direction_seed = 0.0
+        decision_reason = ""
+
+        if abs(yaw_error) >= self.config.blocked_yaw_bias_threshold:
+            direction_seed = yaw_error
+            decision_reason = "yaw_error"
+        else:
+            # Положительная разница означает, что слева свободнее, отрицательная — справа.
+            space_delta = left_space - right_space
+            if abs(space_delta) >= self.config.blocked_direction_bias_threshold:
+                direction_seed = space_delta
+                decision_reason = "lidar_delta"
+            elif w_cmd != 0.0:
+                direction_seed = w_cmd
+                decision_reason = "existing_w"
+            else:
+                # Чередуем направления: нечётные шаги — влево, чётные — вправо.
+                direction_seed = 1.0 if (self.state.blocked_steps % 2 == 1) else -1.0
+                decision_reason = "alternating"
+
+        direction = math.copysign(1.0, direction_seed if direction_seed != 0.0 else 1.0)
+        # Небольшая ненулевая величина нужна, чтобы `_apply_blocked_turn_boost`
+        # сохранил выбранный знак и не вернул дефолтное вращение влево.
+        hint_magnitude = max(abs(w_cmd), 1e-3)
+        resolved = direction * hint_magnitude
+
+        self.logger.debug(
+            "Блокировка спереди: причина выбора=%s, yaw_error=%.3f рад, left=%.2f м, right=%.2f м, шаг=%d -> w=%.3f рад/с",
+            decision_reason,
+            yaw_error,
+            left_space,
+            right_space,
+            self.state.blocked_steps,
+            resolved,
+        )
+
+        return resolved

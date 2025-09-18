@@ -108,7 +108,7 @@ def test_blocked_turn_uses_course_sign_when_avoidance_cancels(navigator):
     command = navigator.step(0.1)
 
     assert command["v"] == pytest.approx(0.0, abs=1e-6)
-    assert command["w"] > 0.0
+    assert command["w"] < 0.0
 
 
 def test_blocked_turn_boosts_existing_rotation(navigator):
@@ -131,6 +131,45 @@ def test_apply_blocked_turn_boost_prefers_yaw_error(navigator):
 
     result_left = navigator._apply_blocked_turn_boost(0.0, 0.0)
     assert result_left == pytest.approx(navigator.config.blocked_turn_speed)
+
+
+def test_blocked_direction_prefers_wider_side(navigator):
+    """Если слева свободнее, разворот должен происходить влево при малой угловой ошибке."""
+
+    navigator.update_pose(0.0, 0.0, 0.0)
+    # Правая половина лидара показывает стену, левая — свободна.
+    navigator.update_scan([0.32, 0.31, 0.3, 0.75, 0.9])
+
+    command = navigator.step(0.1)
+
+    assert command["v"] == pytest.approx(0.0, abs=1e-6)
+    assert command["w"] > 0.0
+
+
+def test_blocked_direction_alternates_without_hints(navigator):
+    """При симметричном окружении направление должно чередоваться, чтобы робот не застревал."""
+
+    navigator.update_pose(0.0, 0.0, 0.0)
+    navigator.update_scan([0.33, 0.33, 0.32, 0.33, 0.33])
+
+    first = navigator.step(0.1)
+    navigator.update_scan([0.33, 0.33, 0.32, 0.33, 0.33])
+    second = navigator.step(0.1)
+
+    assert first["w"] == pytest.approx(navigator.config.blocked_turn_speed)
+    assert second["w"] == pytest.approx(-navigator.config.blocked_turn_speed)
+
+
+def test_resolve_blocked_turn_uses_yaw_priority(navigator):
+    """Вспомогательный метод должен отдавать приоритет курсовой ошибке при достаточном значении."""
+
+    navigator.state.blocked_steps = 3
+    decision = navigator._resolve_blocked_turn_direction(0.0, math.radians(20.0), 0.4, 0.4)
+    assert decision > 0.0
+
+    navigator.state.blocked_steps = 2
+    decision_right = navigator._resolve_blocked_turn_direction(0.0, -math.radians(20.0), 0.4, 0.4)
+    assert decision_right < 0.0
 
 
 def test_apply_blocked_turn_boost_respects_max_speed(navigator):
