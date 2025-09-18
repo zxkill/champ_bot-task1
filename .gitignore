@@ -1,0 +1,60 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Virtual environments
+env/
+venv/
+.venv/
+
+# Environment variables
+.env
+.env.*         # e.g., .env.local, .env.test
+
+# Dependency directories
+.venv/
+__pypackages__/
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Test outputs
+.pytest_cache/
+htmlcov/
+coverage.xml
+
+# Mypy, flake8, isort, black caches
+.mypy_cache/
+.tox/
+.cache/
+.pyre/
+
+# FastAPI / Uvicorn
+# (обычно в репо нет генерируемых файлов, но можно игнорировать логи)
+*.log
+
+# Alembic (версионирование БД) — кеши внутри версий
+alembic/versions/__pycache__/
+
+# Sphinx docs
+docs/_build/
+
+# IDE / редакторы
+.vscode/
+.idea/
+*.sublime-*
+*.iml
+
+# Docker overrides
+docker-compose.override.yml

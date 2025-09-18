@@ -4,6 +4,8 @@ import socket
 import struct
 import time
 
+from tools import compute_required_gap_width, find_corridors, corridor_fits
+
 CMD_HOST  = str(os.getenv("CMD_HOST", "127.0.0.1"))
 CMD_PORT  = int(os.getenv("CMD_PORT", "5555"))
 TEL_HOST  = str(os.getenv("TEL_HOST", "0.0.0.0"))
@@ -16,6 +18,23 @@ CRASH_DIST = 0.3
 RECOVER_TIME = 1               # время отката назад
 TURN_TIME = 0.6                # базовое время для поворота
 FORWARD_SPEED = 0.6            # м/с
+
+# demo.py (замени строку с from controllers.udp_diff.udp_diff import WHEEL_BASE ...)
+WHEEL_BASE   = float(os.getenv("WHEEL_BASE", "0.25"))
+WHEEL_RADIUS = float(os.getenv("WHEEL_RADIUS", "0.035"))
+
+
+# 1) Считаем требуемую ширину проёма
+required_width = compute_required_gap_width(
+    wheel_base=WHEEL_BASE,
+    side_margin=0.04,          # подбери по месту/шуму лидара
+    body_extra_each_side=0.02, # свесы корпуса за колёса, если есть (подбери)
+)
+
+# 2) Вперёд должен быть запас — возьмём минимум как 0.35 м,
+#    но можно завязать на габарит по базе, чтобы не «тыкаться носом»:
+min_forward_clearance = max(0.35, WHEEL_BASE * 1.2)
+
 
 # === Машина состояний ===
 state = "FORWARD"
@@ -91,66 +110,87 @@ try:
         if not ranges:
             continue
 
+        corrs = find_corridors(ranges, fov_deg=90.0, max_lookahead=3.0,
+                               min_points=3, min_depth_for_corridor=0.5)
+
+        good = []
+        for c in corrs:
+            ok, plan = corridor_fits(
+                c,
+                required_width=required_width,
+                min_forward_clearance=min_forward_clearance
+            )
+            if ok:
+                c["plan"] = plan
+                good.append(c)
+
+        if good:
+            best = max(good, key=lambda c: c["plan"]["expected_width"])
+            print(
+                f"[corridor] ok: yaw={best['ang_center']:+.1f}° "
+                f"d*={best['plan']['target_depth']:.2f} m "
+                f"w≈{best['plan']['expected_width']:.2f} m "
+                f"(need≥{best['plan']['required_width']:.2f}) "
+                f"segment=[{best['i0']}-{best['i1']}]"
+            )
+        else:
+            print("[corridor] no suitable corridor")
+
         now = time.time()
 
         # проверка движения (анти-застревание по одометрии)
-        if last_pos is not None:
-            dx = x - last_pos[0]
-            dy = y - last_pos[1]
-            dist_moved = (dx**2 + dy**2)**0.5
-            if dist_moved > 0.02:
-                last_move_time = now
-        last_pos = (x, y)
+        # if last_pos is not None:
+        #     dx = x - last_pos[0]
+        #     dy = y - last_pos[1]
+        #     dist_moved = (dx**2 + dy**2)**0.5
+        #     if dist_moved > 0.02:
+        #         last_move_time = now
+        # last_pos = (x, y)
+        #
+        # stuck = (now - last_move_time > 2.0)
+        #
+        # n = len(ranges)
+        # mid_idx = n // 2
+        # right_idx = int(n * 3 / 4)
+        # left_idx = int(n * 1 / 4)
+        #
+        # front_dist = ranges[mid_idx]
+        # right_dist = ranges[right_idx]
+        # left_dist = ranges[left_idx]
+        # print(f"state {state} dist {front_dist} dist {right_dist} dist {left_dist}")
+        # # === Управление по состояниям ===
+        # if now < state_until:
+        #     action = state
+        # else:
+        #     # аварийная проверка столкновения
+        #     if front_dist < CRASH_DIST or right_dist < CRASH_DIST or left_dist < CRASH_DIST:
+        #         state = "RECOVER"
+        #         state_until = now + RECOVER_TIME
+        #         turn_dir = 1.0 if right_dist > left_dist else -1.0
+        #         send_cmd(-0.15, 1.0 * turn_dir)  # назад + поворот
+        #         action = f"RECOVER(dir={turn_dir:+})"
+        #         time.sleep(1)
+        #
+        #     elif right_dist > SAFE_DIST:
+        #         state = "TURN_RIGHT"
+        #         state_until = now + TURN_TIME
+        #         send_cmd(0.15, -1.0)
+        #         action = "TURN_RIGHT"
+        #
+        #     elif front_dist > SAFE_DIST:
+        #         # скорость пропорциональна расстоянию до препятствия
+        #         v = min(FORWARD_SPEED, 0.1 + 0.5 * front_dist)
+        #         state = "FORWARD"
+        #         state_until = now + 0.3
+        #         send_cmd(v, 0.0)
+        #         action = f"FORWARD(v={v:.2f})"
+        #
+        #     else:
+        #         state = "TURN_LEFT"
+        #         state_until = now + TURN_TIME
+        #         send_cmd(0.15, 1.0)
+        #         action = "TURN_LEFT"
 
-        stuck = (now - last_move_time > 2.0)
-
-        n = len(ranges)
-        mid_idx = n // 2
-        right_idx = int(n * 3 / 4)
-        left_idx = int(n * 1 / 4)
-
-        front_dist = ranges[mid_idx]
-        right_dist = ranges[right_idx]
-        left_dist = ranges[left_idx]
-
-        # === Управление по состояниям ===
-        if now < state_until:
-            action = state
-        else:
-            # аварийная проверка столкновения
-            if front_dist < CRASH_DIST or right_dist < CRASH_DIST or left_dist < CRASH_DIST:
-                state = "RECOVER"
-                state_until = now + RECOVER_TIME
-                turn_dir = 1.0 if right_dist > left_dist else -1.0
-                send_cmd(-0.15, 1.0 * turn_dir)  # назад + поворот
-                action = f"RECOVER(dir={turn_dir:+})"
-                time.sleep(1)
-
-            elif right_dist > SAFE_DIST:
-                state = "TURN_RIGHT"
-                state_until = now + TURN_TIME
-                send_cmd(0.15, -1.0)
-                action = "TURN_RIGHT"
-
-            elif front_dist > SAFE_DIST:
-                # скорость пропорциональна расстоянию до препятствия
-                v = min(FORWARD_SPEED, 0.1 + 0.5 * front_dist)
-                state = "FORWARD"
-                state_until = now + 0.3
-                send_cmd(v, 0.0)
-                action = f"FORWARD(v={v:.2f})"
-
-            else:
-                state = "TURN_LEFT"
-                state_until = now + TURN_TIME
-                send_cmd(0.15, 1.0)
-                action = "TURN_LEFT"
-
-        print(f"[client] state={state} pos=({x:.2f},{y:.2f},θ={math.degrees(th):.1f}°) "
-              f"vel=({vx:.2f},{vy:.2f},{vth:.2f}) gyro=({wx:.2f},{wy:.2f},{wz:.2f}) "
-              f"front={front_dist:.2f} right={right_dist:.2f} left={left_dist:.2f} → {action}")
-
-        # time.sleep(0.1)
 
 except KeyboardInterrupt:
     print("[client] stop")

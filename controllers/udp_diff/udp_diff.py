@@ -38,10 +38,10 @@ WHEEL_RADIUS = 0.035
 SPEEDUP = int(os.getenv("SPEEDUP", "2"))
 
 # Реалистичные ограничения движения:
-BASE_MAX_LINEAR = 0.5  # м/с
-BASE_MAX_ANGULAR = 1.0  # рад/с
-BASE_MAX_LINEAR_ACC = 0.05  # м/с²
-BASE_MAX_ANGULAR_ACC = 0.2  # рад/с²
+BASE_MAX_LINEAR = 0.66  # м/с
+BASE_MAX_ANGULAR = 6.0  # рад/с
+BASE_MAX_LINEAR_ACC = 3.3  # м/с²
+BASE_MAX_ANGULAR_ACC = 30  # рад/с²
 
 # Ускоренные ограничения движения:
 MAX_LINEAR = BASE_MAX_LINEAR * SPEEDUP
