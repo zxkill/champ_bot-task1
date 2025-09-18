@@ -99,17 +99,16 @@ def test_forward_motion_blocked_when_clearance_small(navigator, caplog):
     assert "Недостаточный зазор спереди" in caplog.text
 
 
-def test_blocked_turn_uses_course_sign_when_avoidance_cancels(navigator):
-    """Если избегание полностью компенсировало базовый поворот, разворот должен следовать знаку yaw_error."""
+def test_blocked_turn_follows_fixed_direction(navigator):
+    """При симметричных данных лидар робот обязан крутиться в заданную сторону."""
 
     navigator.update_pose(0.0, 0.0, -0.2)
-    navigator.config.avoidance_max_correction = 0.5
-    navigator.update_scan([0.7, 0.7, 0.7, 0.25, 0.25])
+    navigator.update_scan([0.35, 0.34, 0.33, 0.34, 0.35])
 
     command = navigator.step(0.1)
 
     assert command["v"] == pytest.approx(0.0, abs=1e-6)
-    assert command["w"] < 0.0
+    assert command["w"] > 0.0
 
 
 def test_blocked_turn_boosts_existing_rotation(navigator):
@@ -134,127 +133,91 @@ def test_apply_blocked_turn_boost_prefers_yaw_error(navigator):
     assert result_left == pytest.approx(navigator.config.blocked_turn_speed)
 
 
-def test_blocked_direction_prefers_wider_side(navigator):
-    """Если слева свободнее, разворот должен происходить влево при малой угловой ошибке."""
+def test_blocked_scan_full_rotation_stops(navigator, caplog):
+    """После полного оборота без коридора команды должны замереть."""
 
+    navigator.config.scan_full_rotation = math.radians(10.0)
     navigator.update_pose(0.0, 0.0, 0.0)
-    # Правая половина лидара показывает стену, левая — свободна.
-    navigator.update_scan([0.32, 0.31, 0.3, 0.75, 0.9])
+    navigator.update_scan([0.32, 0.31, 0.3, 0.31, 0.32])
+    navigator.step(0.1)
 
-    command = navigator.step(0.1)
+    navigator.update_pose(0.0, 0.0, math.radians(6.0))
+    navigator.update_scan([0.32, 0.31, 0.3, 0.31, 0.32])
+    navigator.step(0.1)
+
+    navigator.update_pose(0.0, 0.0, math.radians(12.0))
+    navigator.update_scan([0.32, 0.31, 0.3, 0.31, 0.32])
+    with caplog.at_level(logging.ERROR):
+        command = navigator.step(0.1)
 
     assert command["v"] == pytest.approx(0.0, abs=1e-6)
-    assert command["w"] > 0.0
+    assert command["w"] == pytest.approx(0.0, abs=1e-6)
+    assert navigator.state.blocked_scan_failed is True
+    assert "Полный круг" in caplog.text
 
 
-def test_blocked_direction_uses_alternating_seed_once(navigator):
-    """Первое решение при симметрии должно зависеть от счётчика блокировок."""
+def test_blocked_scan_recovers_after_clearance(navigator):
+    """Как только коридор найден, все счётчики блокировки должны сбрасываться."""
 
+    navigator.config.scan_full_rotation = math.radians(10.0)
     navigator.update_pose(0.0, 0.0, 0.0)
-    navigator.update_scan([0.33, 0.33, 0.32, 0.33, 0.33])
+    navigator.update_scan([0.32, 0.31, 0.3, 0.31, 0.32])
+    navigator.step(0.1)
+    navigator.update_pose(0.0, 0.0, math.radians(12.0))
+    navigator.update_scan([0.32, 0.31, 0.3, 0.31, 0.32])
+    navigator.step(0.1)
 
-    first = navigator.step(0.1)
-    assert first["w"] == pytest.approx(navigator.config.blocked_turn_speed)
-
-    # Сбрасываем скан, но оставляем блокировку — направление не должно меняться.
-    navigator.update_scan([0.33, 0.33, 0.32, 0.33, 0.33])
-    second = navigator.step(0.1)
-
-    assert second["w"] == pytest.approx(navigator.config.blocked_turn_speed)
-    assert navigator.state.blocked_turn_direction == pytest.approx(1.0)
-
-
-def test_blocked_direction_stays_sticky_until_clear(navigator):
-    """Как только выбран знак разворота, он должен сохраняться до снятия блокировки."""
-
-    navigator.config.blocked_release_rotation = math.radians(5.0)
+    navigator.update_scan([1.2, 1.2, 1.2, 1.2, 1.2])
     navigator.update_pose(0.0, 0.0, 0.0)
-    navigator.update_scan([0.33, 0.33, 0.32, 0.33, 0.33])
+    command = navigator.step(0.1)
 
-    navigator.step(0.1)
-    navigator.update_scan([0.33, 0.33, 0.32, 0.33, 0.33])
-    navigator.step(0.1)
-
-    # Имитация освобождения прохода: большой зазор спереди.
-    navigator.update_pose(0.0, 0.0, 0.2)
-    navigator.update_scan([1.0, 1.0, 1.0, 1.0, 1.0])
-    navigator.step(0.1)
-
+    assert command["v"] >= 0.0
     assert navigator.state.blocked_steps == 0
     assert navigator.state.blocked_turn_direction is None
+    assert navigator.state.blocked_scan_failed is False
 
 
 def test_blocked_direction_waits_for_release_margin(navigator):
-    """Гистерезис должен удерживать блокировку, пока не появится дополнительный запас по дистанции."""
+    """Гистерезис по дистанции должен удерживать вращение, пока запаса недостаточно."""
 
     navigator.config.clearance_release_margin = 0.2
     navigator.update_pose(0.0, 0.0, 0.0)
-
-    # Первый шаг с симметричным препятствием — фиксируем направление и блокировку.
     navigator.update_scan([0.38, 0.36, 0.33, 0.36, 0.38])
     first_command = navigator.step(0.1)
     assert first_command["v"] == pytest.approx(0.0, abs=1e-6)
-    initial_turn = first_command["w"]
 
-    # Теперь фронтальный зазор слегка вырос, но не достиг лимита разблокировки — режим должен сохраниться.
-    navigator.update_scan([0.62, 0.6, 0.58, 0.6, 0.62])
+    navigator.update_scan([0.5, 0.48, 0.46, 0.48, 0.5])
     second_command = navigator.step(0.1)
     assert second_command["v"] == pytest.approx(0.0, abs=1e-6)
-    assert second_command["w"] == pytest.approx(initial_turn)
 
-
-def test_blocked_requires_extra_rotation_before_release(navigator, caplog):
-    """Даже при появлении свободного места робот продолжает крутиться, пока не набрал нужный угол."""
-
-    navigator.config.blocked_release_rotation = math.radians(200.0)
-    navigator.logger.setLevel(logging.DEBUG)
-    navigator.update_pose(0.0, 0.0, 0.0)
-    navigator.update_scan([0.38, 0.36, 0.33, 0.36, 0.38])
-    navigator.step(0.1)
-
-    caplog.clear()
-    navigator.update_pose(0.0, 0.0, 1.0)
-    navigator.update_scan([1.2, 1.2, 1.2, 1.2, 1.2])
-    with caplog.at_level("DEBUG"):
-        hold_command = navigator.step(0.1)
-    assert hold_command["v"] == pytest.approx(0.0, abs=1e-6)
-    assert "Продолжаем разворот после освобождения" in caplog.text
-
-    caplog.clear()
-    navigator.update_pose(0.0, 0.0, 2.4)
-    navigator.update_scan([1.2, 1.2, 1.2, 1.2, 1.2])
-    navigator.step(0.1)
-
-    caplog.clear()
-    navigator.update_pose(0.0, 0.0, -2.6)
-    navigator.update_scan([1.2, 1.2, 1.2, 1.2, 1.2])
-    with caplog.at_level("INFO"):
-        release_command = navigator.step(0.1)
-
-    assert release_command["target"] == pytest.approx((1.0, 0.0))
-    assert navigator.state.blocked_steps == 0
-    assert navigator.state.blocked_turn_direction is None
-    assert "поворот" in caplog.text
-
-    # Когда появляется устойчивый запас, навигатор должен выйти из блокировки и забыть направление.
     navigator.update_scan([0.9, 0.9, 0.9, 0.9, 0.9])
-    third_command = navigator.step(0.1)
-    assert third_command["v"] >= 0.0
-    assert navigator.state.blocked_steps == 0
-    assert navigator.state.blocked_turn_direction is None
+    release_command = navigator.step(0.1)
+    assert release_command["v"] >= 0.0
 
 
-def test_resolve_blocked_turn_uses_yaw_priority(navigator):
-    """Вспомогательный метод должен отдавать приоритет курсовой ошибке при достаточном значении."""
+def test_scan_direction_configurable(navigator):
+    """Смена знака конфигурации должна разворачивать робот вправо."""
 
-    navigator.state.blocked_steps = 3
+    navigator.config.scan_fixed_direction = -1.0
+    navigator.update_pose(0.0, 0.0, 0.0)
+    navigator.update_scan([0.34, 0.33, 0.32, 0.33, 0.34])
+    command = navigator.step(0.1)
+
+    assert command["w"] < 0.0
+
+
+def test_resolve_blocked_turn_direction_without_fixed(navigator):
+    """Когда фиксированного направления нет, метод должен полагаться на данные лидара."""
+
+    navigator.config.scan_fixed_direction = None
+    navigator.state.blocked_steps = 1
     navigator.state.blocked_turn_direction = None
-    decision = navigator._resolve_blocked_turn_direction(0.0, math.radians(20.0), 0.4, 0.4)
+    decision = navigator._resolve_blocked_turn_direction(0.0, 0.0, 0.8, 0.3)
     assert decision > 0.0
 
     navigator.state.blocked_steps = 2
     navigator.state.blocked_turn_direction = None
-    decision_right = navigator._resolve_blocked_turn_direction(0.0, -math.radians(20.0), 0.4, 0.4)
+    decision_right = navigator._resolve_blocked_turn_direction(0.0, 0.0, 0.3, 0.8)
     assert decision_right < 0.0
 
 

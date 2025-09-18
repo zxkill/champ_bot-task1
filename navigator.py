@@ -48,7 +48,8 @@ class NavigatorConfig:
     blocked_turn_speed: float = 1.2  # минимальная |ω|, когда стоим из-за недостаточного зазора
     blocked_direction_bias_threshold: float = 0.07  # насколько должен отличаться свободный простор слева/справа
     blocked_yaw_bias_threshold: float = math.radians(12.0)  # ошибка курса, при которой ей доверяем больше лидара
-    blocked_release_rotation: float = math.radians(210.0)  # сколько нужно провернуть корпус, прежде чем снова пытаться ехать вперёд
+    scan_fixed_direction: float = 1.0  # знак постоянного разворота при поиске коридора (+1 — влево)
+    scan_full_rotation: float = 2.0 * math.pi  # предельный угол обзора: после полного оборота без коридора останавливаемся
     lidar_fov_deg: float = 45.0  # сектор обзора используемого лидара
     log_level: int = logging.INFO  # отдельный уровень логов навигатора
 
@@ -67,6 +68,7 @@ class NavigatorState:
     yaw_unwrapped: float = 0.0  # накопленный курс без обрезки в диапазоне [-pi, pi]
     blocked_yaw_last: Optional[float] = None  # курс на предыдущем шаге блокировки для подсчёта интегрального поворота
     blocked_rotation_accum: float = 0.0  # суммарный абсолютный поворот корпуса за время блокировки
+    blocked_scan_failed: bool = False  # флаг: полный оборот выполнен, но коридор не найден
 
 
 class WaypointNavigator:
@@ -353,16 +355,6 @@ class WaypointNavigator:
                 slowdown = max(0.0, min(1.0, range_min / self.config.slowdown_distance))
                 v_cmd = max(self.config.min_speed, v_cmd * slowdown)
 
-            if not forward_blocked and was_blocked:
-                required_rotation = self.config.blocked_release_rotation
-                if self.state.blocked_rotation_accum < required_rotation:
-                    forward_blocked = True
-                    self.logger.debug(
-                        "Продолжаем разворот после освобождения: накоплено %.2f рад < %.2f рад",
-                        self.state.blocked_rotation_accum,
-                        required_rotation,
-                    )
-
             avoidance = self.config.avoidance_gain * avoidance_raw
             avoidance = max(
                 -self.config.avoidance_max_correction,
@@ -388,13 +380,27 @@ class WaypointNavigator:
             range_min = math.inf
 
         if forward_blocked:
-            # При блокировке выбираем сторону разворота, опираясь на данные лидара и историю.
+            # При блокировке вращаемся в фиксированную сторону, пока не увидим коридор
+            # или не выполним полный оборот без результата.
             if not was_blocked:
                 self._update_blocked_rotation_tracker(entering=True)
+                self.state.blocked_scan_failed = False
             self.state.blocked_steps += 1
-            w_cmd = self._resolve_blocked_turn_direction(w_cmd, yaw_error, left_min, right_min)
-            # Если вперёд идти нельзя, ускоряем поворот, чтобы быстрее освободить себе путь.
-            w_cmd = self._apply_blocked_turn_boost(w_cmd, yaw_error)
+
+            if not self.state.blocked_scan_failed:
+                w_cmd = self._resolve_blocked_turn_direction(w_cmd, yaw_error, left_min, right_min)
+                w_cmd = self._apply_blocked_turn_boost(w_cmd, yaw_error)
+
+                if self.state.blocked_rotation_accum >= self.config.scan_full_rotation:
+                    self.state.blocked_scan_failed = True
+                    self.logger.error(
+                        "Полный круг %.2f рад завершён без обнаружения коридора — остаёмся на месте",
+                        self.state.blocked_rotation_accum,
+                    )
+
+            if self.state.blocked_scan_failed:
+                v_cmd = 0.0
+                w_cmd = 0.0
         else:
             if was_blocked:
                 release_limit = (
@@ -403,23 +409,22 @@ class WaypointNavigator:
                 )
                 if math.isfinite(range_min):
                     self.logger.info(
-                        "Фронтальный проход очищен: минимальный зазор %.2f м превышает %.2f м, поворот %.2f рад (порог %.2f рад)",
+                        "Фронтальный проход очищен: минимальный зазор %.2f м превышает %.2f м, поворот %.2f рад",
                         range_min,
                         release_limit,
                         self.state.blocked_rotation_accum,
-                        self.config.blocked_release_rotation,
                     )
                 else:
                     self.logger.info(
-                        "Снимаем блокировку без данных лидара: поворот %.2f рад (порог %.2f рад)",
+                        "Снимаем блокировку без данных лидара: поворот %.2f рад",
                         self.state.blocked_rotation_accum,
-                        self.config.blocked_release_rotation,
                     )
             # Как только проход устойчиво освобождён, забываем выбранное направление и счётчик.
             self.state.blocked_steps = 0
             self.state.blocked_turn_direction = None
             self.state.blocked_yaw_last = None
             self.state.blocked_rotation_accum = 0.0
+            self.state.blocked_scan_failed = False
 
         self.state.last_range_min = range_min
         self.state.last_command = (v_cmd, w_cmd)
@@ -498,7 +503,13 @@ class WaypointNavigator:
         left_space = left_min if math.isfinite(left_min) else self.config.avoidance_distance
         right_space = right_min if math.isfinite(right_min) else self.config.avoidance_distance
 
-        if self.state.blocked_turn_direction is not None:
+        fixed_direction = self.config.scan_fixed_direction
+        if fixed_direction is not None:
+            # Пользователь явно задал постоянное направление обхода — выполняем его.
+            direction = math.copysign(1.0, fixed_direction if fixed_direction != 0.0 else 1.0)
+            self.state.blocked_turn_direction = direction
+            decision_reason = "fixed"
+        elif self.state.blocked_turn_direction is not None:
             direction = math.copysign(1.0, self.state.blocked_turn_direction)
             decision_reason = "sticky"
         else:
