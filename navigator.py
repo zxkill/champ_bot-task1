@@ -1,0 +1,256 @@
+"""Навигация по заранее известным опорным точкам с учётом препятствий.
+
+Модуль содержит простой, но надёжный алгоритм для гонки в замкнутом
+пространстве: робот следует по списку контрольных точек, при этом каждую
+итерацию отслеживает расстояние до препятствий по данным лидара и
+корректирует угловую скорость. Благодаря этому можно заранее разметить
+маршрут (например, выход из правой комнаты, прохождение дверного проёма и
+заезд на белый прямоугольник) и гарантированно удерживать высокую скорость
+без касаний стен.
+"""
+
+from __future__ import annotations
+
+import logging
+import math
+from dataclasses import dataclass, field
+from typing import Iterable, List, Optional, Sequence
+
+
+@dataclass
+class Waypoint:
+    """Структура для хранения одной целевой точки."""
+
+    x: float
+    y: float
+    speed: float
+
+
+@dataclass
+class NavigatorConfig:
+    """Настройки навигатора, сгруппированные в dataclass для удобства."""
+
+    angle_gain: float = 3.0  # усиление поворотного регулятора
+    max_angular_speed: float = 2.4  # ограничение |ω|
+    max_linear_speed: float = 0.9  # верхний предел скорости
+    distance_threshold: float = 0.18  # расстояние до точки для «зачёта» прохождения
+    angle_threshold: float = math.radians(8.0)  # остаточная ошибка ориентации
+    in_place_turn_threshold: float = math.radians(35.0)  # когда только поворачиваемся
+    avoidance_distance: float = 0.8  # зона, в которой препятствия начинают «толкать» робота
+    avoidance_gain: float = 1.6  # коэффициент влияния избегания
+    slowdown_distance: float = 0.55  # линейная скорость начинает снижаться раньше столкновения
+    min_speed: float = 0.05  # нижний предел положительной скорости при движении вперёд
+    hard_stop_distance: float = 0.25  # абсолютный порог остановки при опасном сближении
+    lidar_fov_deg: float = 45.0  # сектор обзора используемого лидара
+    log_level: int = logging.INFO  # отдельный уровень логов навигатора
+
+
+@dataclass
+class NavigatorState:
+    """Вспомогательный объект с накопленной информацией о движении."""
+
+    index: int = 0
+    finished: bool = False
+    last_range_min: float = math.inf
+    last_command: tuple[float, float] = field(default_factory=lambda: (0.0, 0.0))
+
+
+class WaypointNavigator:
+    """Высокоуровневый модуль управления для соревнования.
+
+    Логика работы на каждом шаге:
+    1. Определить активную точку маршрута.
+    2. Рассчитать направление на неё и ошибку по курсу.
+    3. Если ошибка большая — поворачиваемся на месте, иначе движемся вперёд.
+    4. Вносим поправку по препятствиям, используя вектор "отталкивания" от
+       ближайших лучей лидара.
+    5. Сохраняем диагностические величины и отдаём (v, w).
+
+    Для удобства отладки всё сопровождается подробными русскоязычными логами.
+    """
+
+    def __init__(
+        self,
+        waypoints: Sequence[Waypoint],
+        config: NavigatorConfig | None = None,
+        logger: Optional[logging.Logger] = None,
+    ) -> None:
+        self.config = config or NavigatorConfig()
+        self._waypoints: List[Waypoint] = list(waypoints)
+        if not self._waypoints:
+            raise ValueError("Список опорных точек не может быть пустым")
+
+        self.logger = logger or logging.getLogger(self.__class__.__name__)
+        self.logger.setLevel(self.config.log_level)
+
+        self.pose = (0.0, 0.0, 0.0)
+        self._ranges: List[float] = []
+        self.state = NavigatorState()
+
+    # ------------------------------------------------------------------
+    # Служебные методы
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _wrap_angle(angle: float) -> float:
+        """Приводим угол к диапазону [-pi, pi] для корректных расчётов."""
+
+        wrapped = (angle + math.pi) % (2 * math.pi) - math.pi
+        return wrapped
+
+    def _current_waypoint(self) -> Optional[Waypoint]:
+        """Возвращает текущую целевую точку или ``None``, если маршрут пройден."""
+
+        if self.state.finished or self.state.index >= len(self._waypoints):
+            return None
+        return self._waypoints[self.state.index]
+
+    def _advance_waypoint(self) -> None:
+        """Переключаемся на следующую точку и пишем в лог подробности."""
+
+        self.state.index += 1
+        if self.state.index >= len(self._waypoints):
+            self.state.finished = True
+            self.logger.info("Маршрут полностью завершён — робот на целевом прямоугольнике")
+        else:
+            next_wp = self._waypoints[self.state.index]
+            self.logger.info(
+                "Переходим к точке %d: (%.2f, %.2f) со скоростью %.2f м/с",
+                self.state.index,
+                next_wp.x,
+                next_wp.y,
+                next_wp.speed,
+            )
+
+    # ------------------------------------------------------------------
+    # Публичные методы для обновления состояния
+    # ------------------------------------------------------------------
+    def set_waypoints(self, waypoints: Iterable[Waypoint]) -> None:
+        """Полностью заменяет маршрут на новый список точек."""
+
+        self._waypoints = list(waypoints)
+        if not self._waypoints:
+            raise ValueError("Новый маршрут не содержит ни одной точки")
+        self.state = NavigatorState()
+        self.logger.info("Загружен новый маршрут из %d точек", len(self._waypoints))
+
+    def update_pose(self, x: float, y: float, yaw: float) -> None:
+        """Сохраняем текущую позицию и ориентацию, полученные по одометрии."""
+
+        self.pose = (x, y, yaw)
+
+    def update_scan(self, ranges: Sequence[float]) -> None:
+        """Принимаем свежий набор расстояний лидара."""
+
+        self._ranges = [float(r) for r in ranges if r == r and r > 0.0]
+        if not self._ranges:
+            # Если массив пуст, фиксируем это в логах: навигатор перейдёт в
+            # максимально консервативный режим (только разворот).
+            self.logger.warning("Лидар не предоставил валидных данных — держим тормоза")
+
+    # ------------------------------------------------------------------
+    # Основной шаг
+    # ------------------------------------------------------------------
+    def step(self, dt: float) -> dict:
+        """Выполняет расчёт команд на текущей итерации управления."""
+
+        if dt <= 0.0:
+            raise ValueError("Временной шаг должен быть положительным")
+
+        waypoint = self._current_waypoint()
+        if waypoint is None:
+            self.state.last_command = (0.0, 0.0)
+            return {"v": 0.0, "w": 0.0, "target": None, "range_min": self.state.last_range_min}
+
+        x, y, yaw = self.pose
+        dx = waypoint.x - x
+        dy = waypoint.y - y
+        distance = math.hypot(dx, dy)
+
+        if distance <= self.config.distance_threshold:
+            self.logger.info(
+                "Точка %d достигнута: расстояние %.3f м <= порога %.3f м",
+                self.state.index,
+                distance,
+                self.config.distance_threshold,
+            )
+            self._advance_waypoint()
+            waypoint = self._current_waypoint()
+            if waypoint is None:
+                self.state.last_command = (0.0, 0.0)
+                return {"v": 0.0, "w": 0.0, "target": None, "range_min": self.state.last_range_min}
+            dx = waypoint.x - x
+            dy = waypoint.y - y
+            distance = math.hypot(dx, dy)
+
+        desired_yaw = math.atan2(dy, dx)
+        yaw_error = self._wrap_angle(desired_yaw - yaw)
+
+        # Базовая угловая скорость — пропорциональный регулятор по углу.
+        w_cmd = self.config.angle_gain * yaw_error
+        w_cmd = max(-self.config.max_angular_speed, min(self.config.max_angular_speed, w_cmd))
+
+        # Линейную скорость включаем только если робот почти смотрит на цель.
+        if abs(yaw_error) > self.config.in_place_turn_threshold or not self._ranges:
+            v_cmd = 0.0
+        else:
+            # Чем точнее наведён курс, тем быстрее едем.
+            heading_scale = max(0.0, math.cos(yaw_error))
+            base_speed = min(waypoint.speed, self.config.max_linear_speed)
+            v_cmd = base_speed * heading_scale
+
+        # Обработка данных лидара: минимальное расстояние и «отталкивание» от препятствий.
+        range_min = math.inf
+        avoidance = 0.0
+        if self._ranges:
+            n = len(self._ranges)
+            if n == 1:
+                angles = [0.0]
+            else:
+                start = -self.config.lidar_fov_deg / 2.0
+                step = self.config.lidar_fov_deg / (n - 1)
+                angles = [math.radians(start + i * step) for i in range(n)]
+
+            for ang, r in zip(angles, self._ranges):
+                range_min = min(range_min, r)
+                if r < self.config.avoidance_distance:
+                    weight = (self.config.avoidance_distance - r) / self.config.avoidance_distance
+                    side = -1.0 if ang > 0 else 1.0
+                    avoidance += side * weight
+
+            if range_min < self.config.hard_stop_distance:
+                self.logger.warning(
+                    "Препятствие слишком близко (%.2f м) — экстренно тормозим",
+                    range_min,
+                )
+                v_cmd = 0.0
+            elif range_min < self.config.slowdown_distance and v_cmd > 0.0:
+                slowdown = max(0.0, min(1.0, range_min / self.config.slowdown_distance))
+                v_cmd = max(self.config.min_speed, v_cmd * slowdown)
+
+            w_cmd += self.config.avoidance_gain * avoidance
+            w_cmd = max(-self.config.max_angular_speed, min(self.config.max_angular_speed, w_cmd))
+        else:
+            range_min = math.inf
+
+        self.state.last_range_min = range_min
+        self.state.last_command = (v_cmd, w_cmd)
+
+        self.logger.debug(
+            "Цель #%d: (%.2f, %.2f), дистанция %.2f м, ошибка курса %.2f рад -> v=%.3f м/с, w=%.3f рад/с, r_min=%.2f",
+            self.state.index,
+            waypoint.x,
+            waypoint.y,
+            distance,
+            yaw_error,
+            v_cmd,
+            w_cmd,
+            range_min,
+        )
+
+        return {
+            "v": v_cmd,
+            "w": w_cmd,
+            "target": (waypoint.x, waypoint.y),
+            "range_min": range_min,
+            "yaw_error": yaw_error,
+        }
