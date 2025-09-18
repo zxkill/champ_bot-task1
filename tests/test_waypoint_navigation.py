@@ -1,5 +1,6 @@
 """Проверки для модуля навигации по опорным точкам."""
 
+import logging
 import math
 import os
 import sys
@@ -166,6 +167,7 @@ def test_blocked_direction_uses_alternating_seed_once(navigator):
 def test_blocked_direction_stays_sticky_until_clear(navigator):
     """Как только выбран знак разворота, он должен сохраняться до снятия блокировки."""
 
+    navigator.config.blocked_release_rotation = math.radians(5.0)
     navigator.update_pose(0.0, 0.0, 0.0)
     navigator.update_scan([0.33, 0.33, 0.32, 0.33, 0.33])
 
@@ -174,6 +176,7 @@ def test_blocked_direction_stays_sticky_until_clear(navigator):
     navigator.step(0.1)
 
     # Имитация освобождения прохода: большой зазор спереди.
+    navigator.update_pose(0.0, 0.0, 0.2)
     navigator.update_scan([1.0, 1.0, 1.0, 1.0, 1.0])
     navigator.step(0.1)
 
@@ -198,7 +201,40 @@ def test_blocked_direction_waits_for_release_margin(navigator):
     second_command = navigator.step(0.1)
     assert second_command["v"] == pytest.approx(0.0, abs=1e-6)
     assert second_command["w"] == pytest.approx(initial_turn)
-    assert navigator.state.blocked_steps >= 2
+
+
+def test_blocked_requires_extra_rotation_before_release(navigator, caplog):
+    """Даже при появлении свободного места робот продолжает крутиться, пока не набрал нужный угол."""
+
+    navigator.config.blocked_release_rotation = math.radians(200.0)
+    navigator.logger.setLevel(logging.DEBUG)
+    navigator.update_pose(0.0, 0.0, 0.0)
+    navigator.update_scan([0.38, 0.36, 0.33, 0.36, 0.38])
+    navigator.step(0.1)
+
+    caplog.clear()
+    navigator.update_pose(0.0, 0.0, 1.0)
+    navigator.update_scan([1.2, 1.2, 1.2, 1.2, 1.2])
+    with caplog.at_level("DEBUG"):
+        hold_command = navigator.step(0.1)
+    assert hold_command["v"] == pytest.approx(0.0, abs=1e-6)
+    assert "Продолжаем разворот после освобождения" in caplog.text
+
+    caplog.clear()
+    navigator.update_pose(0.0, 0.0, 2.4)
+    navigator.update_scan([1.2, 1.2, 1.2, 1.2, 1.2])
+    navigator.step(0.1)
+
+    caplog.clear()
+    navigator.update_pose(0.0, 0.0, -2.6)
+    navigator.update_scan([1.2, 1.2, 1.2, 1.2, 1.2])
+    with caplog.at_level("INFO"):
+        release_command = navigator.step(0.1)
+
+    assert release_command["target"] == pytest.approx((1.0, 0.0))
+    assert navigator.state.blocked_steps == 0
+    assert navigator.state.blocked_turn_direction is None
+    assert "поворот" in caplog.text
 
     # Когда появляется устойчивый запас, навигатор должен выйти из блокировки и забыть направление.
     navigator.update_scan([0.9, 0.9, 0.9, 0.9, 0.9])

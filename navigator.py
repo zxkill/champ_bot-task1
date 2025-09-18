@@ -48,6 +48,7 @@ class NavigatorConfig:
     blocked_turn_speed: float = 1.2  # минимальная |ω|, когда стоим из-за недостаточного зазора
     blocked_direction_bias_threshold: float = 0.07  # насколько должен отличаться свободный простор слева/справа
     blocked_yaw_bias_threshold: float = math.radians(12.0)  # ошибка курса, при которой ей доверяем больше лидара
+    blocked_release_rotation: float = math.radians(210.0)  # сколько нужно провернуть корпус, прежде чем снова пытаться ехать вперёд
     lidar_fov_deg: float = 45.0  # сектор обзора используемого лидара
     log_level: int = logging.INFO  # отдельный уровень логов навигатора
 
@@ -62,6 +63,10 @@ class NavigatorState:
     last_command: tuple[float, float] = field(default_factory=lambda: (0.0, 0.0))
     blocked_steps: int = 0  # количество последовательных шагов с заблокированным движением вперёд
     blocked_turn_direction: Optional[float] = None  # выбранное направление разворота при блокировке
+    prev_yaw: Optional[float] = None  # предыдущий измеренный курс, чтобы разворачивать угол без скачков
+    yaw_unwrapped: float = 0.0  # накопленный курс без обрезки в диапазоне [-pi, pi]
+    blocked_yaw_last: Optional[float] = None  # курс на предыдущем шаге блокировки для подсчёта интегрального поворота
+    blocked_rotation_accum: float = 0.0  # суммарный абсолютный поворот корпуса за время блокировки
 
 
 class WaypointNavigator:
@@ -106,6 +111,57 @@ class WaypointNavigator:
         wrapped = (angle + math.pi) % (2 * math.pi) - math.pi
         return wrapped
 
+    def _update_unwrapped_yaw(self, yaw: float) -> None:
+        """Обновляет накопленный курс без обрезки, чтобы отслеживать полный поворот."""
+
+        if self.state.prev_yaw is None:
+            # Первый вызов: просто запоминаем угол и используем его как базу.
+            self.state.prev_yaw = yaw
+            self.state.yaw_unwrapped = yaw
+            self.logger.debug("Инициализация непрерывного угла: %.3f рад", yaw)
+            return
+
+        delta = yaw - self.state.prev_yaw
+        if delta > math.pi:
+            delta -= 2 * math.pi
+        elif delta < -math.pi:
+            delta += 2 * math.pi
+
+        self.state.yaw_unwrapped += delta
+        self.state.prev_yaw = yaw
+        self.logger.debug(
+            "Обновили непрерывный угол: прибавка %.3f рад, итог %.3f рад",
+            delta,
+            self.state.yaw_unwrapped,
+        )
+
+    def _update_blocked_rotation_tracker(self, entering: bool) -> None:
+        """Ведёт учёт накопленного поворота во время фронтальной блокировки."""
+
+        if entering:
+            # Сбрасываем счётчики при первом попадании в режим блокировки.
+            self.state.blocked_rotation_accum = 0.0
+            self.state.blocked_yaw_last = self.state.yaw_unwrapped
+            self.logger.debug(
+                "Вошли в режим блокировки: стартовый курс %.3f рад",
+                self.state.yaw_unwrapped,
+            )
+            return
+
+        if self.state.blocked_yaw_last is None:
+            # Попадаем сюда только в случае восстановления после сброса состояния.
+            self.state.blocked_yaw_last = self.state.yaw_unwrapped
+            return
+
+        delta = self.state.yaw_unwrapped - self.state.blocked_yaw_last
+        self.state.blocked_rotation_accum += abs(delta)
+        self.state.blocked_yaw_last = self.state.yaw_unwrapped
+        self.logger.debug(
+            "Блокировка: добавили %.3f рад, суммарно %.3f рад",
+            delta,
+            self.state.blocked_rotation_accum,
+        )
+
     def _current_waypoint(self) -> Optional[Waypoint]:
         """Возвращает текущую целевую точку или ``None``, если маршрут пройден."""
 
@@ -146,6 +202,9 @@ class WaypointNavigator:
         """Сохраняем текущую позицию и ориентацию, полученные по одометрии."""
 
         self.pose = (x, y, yaw)
+        # Параллельно ведём непрерывный курс, чтобы понимать, на сколько градусов
+        # робот уже провернулся относительно начала блокировки.
+        self._update_unwrapped_yaw(yaw)
 
     def update_scan(self, ranges: Sequence[float]) -> None:
         """Принимаем свежий набор расстояний лидара."""
@@ -215,6 +274,9 @@ class WaypointNavigator:
         avoidance_raw = 0.0
         forward_blocked = False  # флаг: нельзя ехать вперёд из-за тесного прохода
         was_blocked = self.state.blocked_steps > 0  # находились ли мы в режиме блокировки на предыдущем шаге
+        if was_blocked:
+            # Каждая итерация блокировки обновляет интегральный угол разворота.
+            self._update_blocked_rotation_tracker(entering=False)
         left_min = math.inf  # минимальное расстояние в левой половине сектора
         right_min = math.inf  # минимальное расстояние в правой половине сектора
         if self._ranges:
@@ -291,6 +353,16 @@ class WaypointNavigator:
                 slowdown = max(0.0, min(1.0, range_min / self.config.slowdown_distance))
                 v_cmd = max(self.config.min_speed, v_cmd * slowdown)
 
+            if not forward_blocked and was_blocked:
+                required_rotation = self.config.blocked_release_rotation
+                if self.state.blocked_rotation_accum < required_rotation:
+                    forward_blocked = True
+                    self.logger.debug(
+                        "Продолжаем разворот после освобождения: накоплено %.2f рад < %.2f рад",
+                        self.state.blocked_rotation_accum,
+                        required_rotation,
+                    )
+
             avoidance = self.config.avoidance_gain * avoidance_raw
             avoidance = max(
                 -self.config.avoidance_max_correction,
@@ -317,25 +389,37 @@ class WaypointNavigator:
 
         if forward_blocked:
             # При блокировке выбираем сторону разворота, опираясь на данные лидара и историю.
+            if not was_blocked:
+                self._update_blocked_rotation_tracker(entering=True)
             self.state.blocked_steps += 1
             w_cmd = self._resolve_blocked_turn_direction(w_cmd, yaw_error, left_min, right_min)
             # Если вперёд идти нельзя, ускоряем поворот, чтобы быстрее освободить себе путь.
             w_cmd = self._apply_blocked_turn_boost(w_cmd, yaw_error)
         else:
-            if was_blocked and math.isfinite(range_min):
-                # Отмечаем момент выхода из блокировки для удобства анализа логов.
+            if was_blocked:
                 release_limit = (
                     self.config.forward_clearance_distance
                     + self.config.clearance_release_margin
                 )
-                self.logger.info(
-                    "Фронтальный проход очищен: минимальный зазор %.2f м превышает %.2f м",
-                    range_min,
-                    release_limit,
-                )
+                if math.isfinite(range_min):
+                    self.logger.info(
+                        "Фронтальный проход очищен: минимальный зазор %.2f м превышает %.2f м, поворот %.2f рад (порог %.2f рад)",
+                        range_min,
+                        release_limit,
+                        self.state.blocked_rotation_accum,
+                        self.config.blocked_release_rotation,
+                    )
+                else:
+                    self.logger.info(
+                        "Снимаем блокировку без данных лидара: поворот %.2f рад (порог %.2f рад)",
+                        self.state.blocked_rotation_accum,
+                        self.config.blocked_release_rotation,
+                    )
             # Как только проход устойчиво освобождён, забываем выбранное направление и счётчик.
             self.state.blocked_steps = 0
             self.state.blocked_turn_direction = None
+            self.state.blocked_yaw_last = None
+            self.state.blocked_rotation_accum = 0.0
 
         self.state.last_range_min = range_min
         self.state.last_command = (v_cmd, w_cmd)
