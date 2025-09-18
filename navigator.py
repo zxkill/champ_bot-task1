@@ -48,7 +48,7 @@ class NavigatorConfig:
     blocked_turn_speed: float = 1.2  # минимальная |ω|, когда стоим из-за недостаточного зазора
     blocked_direction_bias_threshold: float = 0.07  # насколько должен отличаться свободный простор слева/справа
     blocked_yaw_bias_threshold: float = math.radians(12.0)  # ошибка курса, при которой ей доверяем больше лидара
-    scan_fixed_direction: float = 1.0  # знак постоянного разворота при поиске коридора (+1 — влево)
+    scan_fixed_direction: Optional[float] = None  # знак постоянного разворота при поиске коридора (+1 — влево)
     scan_full_rotation: float = 2.0 * math.pi  # предельный угол обзора: после полного оборота без коридора останавливаемся
     lidar_fov_deg: float = 45.0  # сектор обзора используемого лидара
     log_level: int = logging.INFO  # отдельный уровень логов навигатора

@@ -139,6 +139,7 @@ def main(route: RaceRoute | None = None) -> None:
             lidar_fov_deg=LIDAR_FOV,
             forward_clearance_distance=0.4,
             blocked_turn_speed=1.5,
+            scan_fixed_direction=None,  # включаем динамический выбор стороны разворота по yaw_error и лидара
         ),
         logger=logging.getLogger("navigator"),
     )

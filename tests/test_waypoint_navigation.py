@@ -102,6 +102,7 @@ def test_forward_motion_blocked_when_clearance_small(navigator, caplog):
 def test_blocked_turn_follows_fixed_direction(navigator):
     """При симметричных данных лидар робот обязан крутиться в заданную сторону."""
 
+    navigator.config.scan_fixed_direction = 1.0
     navigator.update_pose(0.0, 0.0, -0.2)
     navigator.update_scan([0.35, 0.34, 0.33, 0.34, 0.35])
 
@@ -109,6 +110,19 @@ def test_blocked_turn_follows_fixed_direction(navigator):
 
     assert command["v"] == pytest.approx(0.0, abs=1e-6)
     assert command["w"] > 0.0
+
+
+def test_blocked_turn_follows_yaw_without_fixed(navigator):
+    """Когда фиксированного направления нет, навигатор обязан поддерживать знак yaw_error."""
+
+    navigator.config.scan_fixed_direction = None
+    navigator.update_pose(0.0, 0.0, 0.5)
+    navigator.update_scan([0.34, 0.33, 0.32, 0.33, 0.34])
+
+    command = navigator.step(0.1)
+
+    assert command["v"] == pytest.approx(0.0, abs=1e-6)
+    assert command["w"] < 0.0
 
 
 def test_blocked_turn_boosts_existing_rotation(navigator):
