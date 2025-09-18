@@ -38,6 +38,8 @@ class NavigatorConfig:
     in_place_turn_threshold: float = math.radians(35.0)  # когда только поворачиваемся
     avoidance_distance: float = 0.8  # зона, в которой препятствия начинают «толкать» робота
     avoidance_gain: float = 1.6  # коэффициент влияния избегания
+    avoidance_max_correction: float = 1.1  # максимально допустимое добавление к ω из-за избегания
+    turn_priority_threshold: float = 0.5  # |ω| от регулятора, выше которого избегание не может сменить знак
     slowdown_distance: float = 0.55  # линейная скорость начинает снижаться раньше столкновения
     min_speed: float = 0.05  # нижний предел положительной скорости при движении вперёд
     hard_stop_distance: float = 0.25  # абсолютный порог остановки при опасном сближении
@@ -186,8 +188,10 @@ class WaypointNavigator:
         yaw_error = self._wrap_angle(desired_yaw - yaw)
 
         # Базовая угловая скорость — пропорциональный регулятор по углу.
-        w_cmd = self.config.angle_gain * yaw_error
-        w_cmd = max(-self.config.max_angular_speed, min(self.config.max_angular_speed, w_cmd))
+        w_base = self.config.angle_gain * yaw_error
+        w_base = max(-self.config.max_angular_speed, min(self.config.max_angular_speed, w_base))
+        # Текущая рабочая угловая скорость, которая будет корректироваться избежанием препятствий.
+        w_cmd = w_base
 
         # Линейную скорость включаем только если робот почти смотрит на цель.
         if abs(yaw_error) > self.config.in_place_turn_threshold or not self._ranges:
@@ -201,6 +205,7 @@ class WaypointNavigator:
         # Обработка данных лидара: минимальное расстояние и «отталкивание» от препятствий.
         range_min = math.inf
         avoidance = 0.0
+        avoidance_raw = 0.0
         if self._ranges:
             n = len(self._ranges)
             if n == 1:
@@ -215,7 +220,7 @@ class WaypointNavigator:
                 if r < self.config.avoidance_distance:
                     weight = (self.config.avoidance_distance - r) / self.config.avoidance_distance
                     side = -1.0 if ang > 0 else 1.0
-                    avoidance += side * weight
+                    avoidance_raw += side * weight
 
             if range_min < self.config.hard_stop_distance:
                 self.logger.warning(
@@ -227,7 +232,26 @@ class WaypointNavigator:
                 slowdown = max(0.0, min(1.0, range_min / self.config.slowdown_distance))
                 v_cmd = max(self.config.min_speed, v_cmd * slowdown)
 
-            w_cmd += self.config.avoidance_gain * avoidance
+            avoidance = self.config.avoidance_gain * avoidance_raw
+            avoidance = max(
+                -self.config.avoidance_max_correction,
+                min(self.config.avoidance_max_correction, avoidance),
+            )
+            tentative_w = w_cmd + avoidance
+            # Если регулятор ориентации уверенно требует поворота (|ω| выше порога),
+            # избегание может лишь ослабить его, но не менять направление.
+            if (
+                abs(w_base) >= self.config.turn_priority_threshold
+                and w_base * tentative_w < 0.0
+            ):
+                w_cmd = w_base
+                self.logger.debug(
+                    "Избегание (%.3f рад/с) не меняет знак поворота, сохраняем w=%.3f",
+                    avoidance,
+                    w_cmd,
+                )
+            else:
+                w_cmd = tentative_w
             w_cmd = max(-self.config.max_angular_speed, min(self.config.max_angular_speed, w_cmd))
         else:
             range_min = math.inf

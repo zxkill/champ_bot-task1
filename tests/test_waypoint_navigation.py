@@ -91,6 +91,18 @@ def test_slowdown_region_between_stop_and_clear(navigator):
     assert command["v"] < navigator.config.max_linear_speed
 
 
+def test_avoidance_cannot_flip_turn_direction(navigator):
+    """Когда нужно резко развернуться, добавка избегания не должна разворачивать робот."""
+
+    # Цель позади справа => yaw_error отрицательная, нужно вращаться вправо (ω < 0).
+    navigator.update_pose(0.0, 0.0, math.pi)
+    # Справа (углы < 0) располагаются препятствия на расстоянии 0.3 м,
+    # что пытается сместить поворот влево. Проверяем, что ограничение сохраняет знак ω.
+    navigator.update_scan([0.35, 0.32, 0.3, 0.32, 0.35])
+    command = navigator.step(0.1)
+    assert command["w"] < 0.0
+
+
 def test_refuses_non_positive_dt(navigator):
     """Нулевой шаг интегрирования должен приводить к ошибке."""
 
