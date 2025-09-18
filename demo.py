@@ -7,7 +7,12 @@ import socket
 import struct
 import time
 
-from tools import compute_required_gap_width, find_corridors, corridor_fits
+from tools import (
+    compute_required_gap_width,
+    corridor_fits,
+    corridor_width_margin,
+    find_corridors,
+)
 from corridor_follower import CorridorFollower
 
 logging.basicConfig(
@@ -29,6 +34,8 @@ RECOVER_TIME = 1               # время отката назад
 TURN_TIME = 0.6                # базовое время для поворота
 FORWARD_SPEED = 0.6            # м/с
 WIDTH_TOLERANCE = float(os.getenv("WIDTH_TOLERANCE", "0.02"))  # м — допустимое сужение коридора
+WIDTH_RECOVERY_MARGIN = float(os.getenv("WIDTH_RECOVERY_MARGIN", "0.04"))  # м — доп. поблажка при удержании
+CORRIDOR_RECOVERY_HOLD_SEC = float(os.getenv("CORRIDOR_RECOVERY_HOLD_SEC", "0.6"))  # c — как долго держим коридор при просадке
 
 # demo.py (замени строку с from controllers.udp_diff.udp_diff import WHEEL_BASE ...)
 WHEEL_BASE   = float(os.getenv("WHEEL_BASE", "0.25"))
@@ -54,6 +61,13 @@ last_pos = None
 start_time = time.time()
 last_move_time = start_time
 last_control_time = start_time
+
+# Текущее «прилипание» к выбранному коридору. Храним его геометрию/план и дедлайн,
+# до которого разрешаем удерживать коридор даже при временных просадках по ширине.
+active_corridor = None
+active_plan = None
+active_corridor_id = None
+active_hold_until = 0.0
 
 sock_cmd = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
@@ -135,6 +149,7 @@ try:
                                min_points=3, min_depth_for_corridor=0.5)
 
         good = []
+        near_miss = {}
         for c in corrs:
             ok, plan = corridor_fits(
                 c,
@@ -146,12 +161,19 @@ try:
                 c["plan"] = plan
                 good.append(c)
             else:
+                margin = corridor_width_margin(
+                    c,
+                    required_width=required_width,
+                    width_tolerance=WIDTH_TOLERANCE,
+                )
+                near_miss[(c["i0"], c["i1"])] = margin
                 logger.debug(
-                    "Коридор %s отклонён: ширина %.2f м при запросе %.2f м, глубина %.2f м",
+                    "Коридор %s отклонён: ширина %.2f м при запросе %.2f м, глубина %.2f м, запас %.3f м",
                     (c["i0"], c["i1"]),
                     c.get("width_at_best", float("nan")),
                     required_width,
                     c.get("depth_min", float("nan")),
+                    margin,
                 )
 
         # Фиксируем реальное время шага, чтобы CorridorFollower мог правильно дозировать ускорения.
@@ -159,22 +181,80 @@ try:
         dt = max(1e-3, current_time - last_control_time)
         last_control_time = current_time
 
+        selected = None
+
         if good:
             best = max(good, key=lambda c: c["plan"]["expected_width"])
+            selected = best
+            active_hold_until = current_time + CORRIDOR_RECOVERY_HOLD_SEC
+        else:
+            # Пробуем удержать предыдущий коридор, если просадка по ширине не критичная.
+            if active_corridor_id and active_corridor_id in near_miss:
+                margin = near_miss[active_corridor_id]
+                if margin >= -WIDTH_RECOVERY_MARGIN and current_time < active_hold_until:
+                    # Дополнительно увеличиваем допуск, чтобы corridor_fits выдал план
+                    # с учётом временной просадки.
+                    recovery_tol = WIDTH_TOLERANCE + WIDTH_RECOVERY_MARGIN
+                    for c in corrs:
+                        if (c["i0"], c["i1"]) == active_corridor_id:
+                            ok_rec, plan_rec = corridor_fits(
+                                c,
+                                required_width=required_width,
+                                min_forward_clearance=min_forward_clearance,
+                                width_tolerance=recovery_tol,
+                            )
+                            if ok_rec:
+                                c["plan"] = plan_rec
+                                selected = c
+                                active_hold_until = current_time + CORRIDOR_RECOVERY_HOLD_SEC
+                                logger.info(
+                                    "Удерживаем коридор %s при временном сужении: запас %.3f м, допуск %.3f м",
+                                    active_corridor_id,
+                                    margin,
+                                    recovery_tol,
+                                )
+                            else:
+                                logger.debug(
+                                    "Не удалось удержать коридор %s даже с расширенным допуском %.3f м",
+                                    active_corridor_id,
+                                    recovery_tol,
+                                )
+                            break
+                else:
+                    if margin < -WIDTH_RECOVERY_MARGIN:
+                        logger.debug(
+                            "Коридор %s слишком сузился: запас %.3f м < допустимого %.3f м",
+                            active_corridor_id,
+                            margin,
+                            -WIDTH_RECOVERY_MARGIN,
+                        )
+                    if current_time >= active_hold_until:
+                        logger.debug(
+                            "Время удержания коридора %s истекло (deadline %.2f, сейчас %.2f)",
+                            active_corridor_id,
+                            active_hold_until,
+                            current_time,
+                        )
+
+        if selected:
+            active_corridor = selected
+            active_plan = selected["plan"]
+            active_corridor_id = (selected["i0"], selected["i1"])
+
             ctrl = follower.step(
                 dt,
                 ranges,
-                best,
-                best["plan"],
-                best["plan"]["requested_width"],
+                active_corridor,
+                active_plan,
+                active_plan["requested_width"],
             )
 
             send_cmd(ctrl["v"], ctrl["w"])
             logger.info(
                 "Коридор %s, ширина %.2f м, глубина %.2f м -> команды: v=%.2f м/с, w=%.2f рад/с",
-                (best["i0"], best["i1"]),
-                best["plan"]["expected_width"],
-                best["plan"]["target_depth"],
+                active_corridor_id,
+                active_plan["expected_width"],
+                active_plan["target_depth"],
                 ctrl["v"],
                 ctrl["w"],
             )
@@ -182,6 +262,9 @@ try:
             # Без безопасного коридора лучше остановиться и пересчитать план.
             send_cmd(0.0, 0.0)
             logger.warning("Подходящих коридоров не найдено — стоим на месте")
+            active_corridor = None
+            active_plan = None
+            active_corridor_id = None
 
         now = current_time
 

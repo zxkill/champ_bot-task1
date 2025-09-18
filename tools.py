@@ -1,6 +1,13 @@
 import math
 from typing import List, Dict, Tuple, Optional
 
+
+# ---------------------------------------------------------------------------
+# Вспомогательные вычисления для коридоров.
+# Здесь сосредоточена математика, чтобы ею могли пользоваться и другие
+# компоненты (демо-клиент, тесты, возможно будущие модули).
+# ---------------------------------------------------------------------------
+
 def _angles_deg(n: int, fov_deg: float) -> List[float]:
     """Равномерные углы от -FOV/2 до +FOV/2 включительно."""
     if n <= 1:
@@ -127,6 +134,37 @@ def corridor_fits(
         }
         return True, plan
     return False, None
+
+
+def corridor_width_margin(
+    corridor: dict,
+    required_width: float,
+    width_tolerance: float,
+) -> float:
+    """Возвращает *запас* по ширине в текущем коридоре относительно требования.
+
+    Положительное значение означает, что коридор шире порога
+    (с учётом допущения ``width_tolerance``), отрицательное — что ширины не
+    хватает. Функция используется для более гибкой логики удержания коридора,
+    когда робот уже начал в него заходить.
+    """
+
+    need = max(0.0, required_width - max(0.0, width_tolerance))
+    left = corridor.get("ang_left")
+    right = corridor.get("ang_right")
+    dmax = corridor.get("depth_min")
+
+    if left is None or right is None or dmax is None:
+        # Если данных не хватает, считаем запас минимальным — так система
+        # будет консервативной и не позволит удерживать неопределённый коридор.
+        return float("-inf")
+
+    gap_tan = math.tan(math.radians(right)) - math.tan(math.radians(left))
+    if gap_tan <= 0.0 or dmax <= 0.0:
+        return float("-inf")
+
+    width_available = dmax * gap_tan
+    return width_available - need
 
 
 def compute_required_gap_width(

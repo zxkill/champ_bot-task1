@@ -13,6 +13,7 @@ from tools import (
     _angles_deg,
     compute_required_gap_width,
     corridor_fits,
+    corridor_width_margin,
     find_corridors,
 )
 
@@ -84,6 +85,32 @@ def test_corridor_fits_tolerance_prevents_dropout():
     assert ok_with_tol is True
     assert plan_with_tol["width_margin"] == pytest.approx(-0.02, abs=1e-6)
     assert plan_with_tol["requested_width"] == pytest.approx(required_width)
+
+
+def test_corridor_width_margin_identifies_near_miss_and_recovery():
+    """Функция должна показывать отрицательный, но ограниченный запас при узком проёме."""
+    corridor = {
+        "ang_left": -25.0,
+        "ang_right": 25.0,
+        "ang_center": 0.0,
+        "depth_min": 0.3,
+    }
+    required_width = 0.33
+    base_tol = 0.02
+
+    margin = corridor_width_margin(corridor, required_width, base_tol)
+    assert margin < 0.0
+    assert margin > -0.05
+
+    ok_recover, plan_recover = corridor_fits(
+        corridor,
+        required_width=required_width,
+        min_forward_clearance=0.25,
+        width_tolerance=base_tol + 0.04,
+    )
+    assert ok_recover is True
+    assert plan_recover["width_margin"] < 0.0
+    assert plan_recover["width_margin"] > -0.08
 
 
 @pytest.fixture()
@@ -170,3 +197,6 @@ def test_angles_and_sanitizing_edge_cases():
     bad_geometry = {"ang_left": 0.0, "ang_right": 0.0, "ang_center": 0.0, "depth_min": 1.0}
     ok, plan = corridor_fits(bad_geometry, required_width=0.3, min_forward_clearance=0.2)
     assert not ok and plan is None
+
+    # corridor_width_margin должен консервативно реагировать на неполные данные.
+    assert corridor_width_margin({}, 0.3, 0.02) == float("-inf")
