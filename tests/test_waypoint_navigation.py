@@ -10,6 +10,7 @@ import pytest
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from navigator import NavigatorConfig, Waypoint, WaypointNavigator  # noqa: E402
+from race_runner import RaceRoute  # noqa: E402
 
 
 @pytest.fixture()
@@ -295,4 +296,26 @@ def test_handles_empty_scan_and_finishes_route(navigator):
 
     repeat = navigator.step(0.1)
     assert repeat["target"] is None
+
+
+def test_race_route_contains_dense_waypoints():
+    """Гоночный маршрут должен состоять из плотной сетки точек без резких скачков."""
+
+    route = RaceRoute.default()
+    # Проверяем, что путь содержит достаточно опорных точек, чтобы робот не пытался угадывать проходы.
+    assert len(route.waypoints) >= 24
+
+    # Дополнительно убеждаемся, что расстояние между соседними точками не превышает 1.6 м,
+    # что гарантирует плавное движение и корректную работу регуляторов в дверном проёме.
+    previous = route.waypoints[0]
+    for current in route.waypoints[1:]:
+        delta = math.hypot(current.x - previous.x, current.y - previous.y)
+        assert delta <= 1.6
+        previous = current
+
+    # Финальная точка должна находиться на белом прямоугольнике и требовать снижения скорости.
+    final_wp = route.waypoints[-1]
+    assert final_wp.x <= 1.0
+    assert final_wp.y >= 0.3
+    assert final_wp.speed <= 0.25
 
