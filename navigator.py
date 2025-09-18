@@ -72,6 +72,8 @@ class NavigatorState:
     blocked_yaw_last: Optional[float] = None  # курс на предыдущем шаге блокировки для подсчёта интегрального поворота
     blocked_rotation_accum: float = 0.0  # суммарный абсолютный поворот корпуса за время блокировки
     blocked_scan_failed: bool = False  # флаг: полный оборот выполнен, но коридор не найден
+    dead_end_turn_remaining: float = 0.0  # сколько радиан ещё нужно провернуться после обнаружения тупика
+    dead_end_turn_direction: Optional[float] = None  # выбранный знак разворота после тупика
 
 
 class WaypointNavigator:
@@ -191,8 +193,14 @@ class WaypointNavigator:
                 next_wp.speed,
             )
 
-    def _skip_dead_end_waypoint(self, range_min: float) -> None:
-        """Пропускает текущую точку маршрута, если обнаружен тупик."""
+    def _skip_dead_end_waypoint(
+        self,
+        range_min: float,
+        yaw_error: float,
+        left_min: float,
+        right_min: float,
+    ) -> None:
+        """Пропускает текущую точку и запускает обязательный разворот на 180°."""
 
         if self.state.index >= len(self._waypoints) - 1:
             # Нечего пропускать — текущая точка уже последняя.
@@ -207,7 +215,47 @@ class WaypointNavigator:
             waypoint.x,
             waypoint.y,
         )
+        self.state.last_range_min = range_min
+        direction = self._select_dead_end_turn_direction(yaw_error, left_min, right_min)
+        self.state.dead_end_turn_remaining = math.pi
+        self.state.dead_end_turn_direction = direction
+        self.logger.info(
+            "Запускаем принудительный разворот на 180° в сторону %s после тупика",
+            "влево" if direction > 0 else "вправо",
+        )
         self._advance_waypoint()
+
+    def _select_dead_end_turn_direction(
+        self,
+        yaw_error: float,
+        left_min: float,
+        right_min: float,
+    ) -> float:
+        """Определяет знак принудительного разворота после обнаружения тупика."""
+
+        if abs(yaw_error) >= self.config.blocked_yaw_bias_threshold:
+            direction = math.copysign(1.0, yaw_error)
+            reason = "yaw_error"
+        else:
+            left_space = left_min if math.isfinite(left_min) else self.config.avoidance_distance
+            right_space = right_min if math.isfinite(right_min) else self.config.avoidance_distance
+            space_delta = left_space - right_space
+            if abs(space_delta) >= self.config.blocked_direction_bias_threshold:
+                direction = math.copysign(1.0, space_delta)
+                reason = "lidar_delta"
+            else:
+                direction = 1.0
+                reason = "default_left"
+
+        self.logger.debug(
+            "Принудительный разворот после тупика: источник=%s, yaw_error=%.3f рад, left=%.2f м, right=%.2f м -> знак=%+.0f",
+            reason,
+            yaw_error,
+            left_min,
+            right_min,
+            direction,
+        )
+        return direction
 
     # ------------------------------------------------------------------
     # Публичные методы для обновления состояния
@@ -255,6 +303,45 @@ class WaypointNavigator:
             if waypoint is None:
                 self.state.last_command = (0.0, 0.0)
                 return {"v": 0.0, "w": 0.0, "target": None, "range_min": self.state.last_range_min}
+
+            if self.state.dead_end_turn_remaining > 0.0:
+                direction = self.state.dead_end_turn_direction or 1.0
+                turn_speed = self.config.max_angular_speed
+                max_rotation = turn_speed * dt
+                required = self.state.dead_end_turn_remaining
+                if required < max_rotation and dt > 0.0:
+                    w_cmd = direction * (required / dt)
+                else:
+                    w_cmd = direction * turn_speed
+
+                rotation = abs(w_cmd) * dt
+                remaining = max(0.0, required - rotation)
+                self.state.dead_end_turn_remaining = remaining
+
+                if remaining == 0.0:
+                    self.logger.info("Принудительный разворот после тупика завершён — возвращаемся к маршруту")
+                    self.state.dead_end_turn_direction = None
+                else:
+                    self.logger.debug(
+                        "Продолжаем разворот после тупика: осталось %.2f рад (%.1f°)",
+                        remaining,
+                        math.degrees(remaining),
+                    )
+
+                self.state.last_command = (0.0, w_cmd)
+                self.logger.debug(
+                    "Команда принудительного разворота: w=%.3f рад/с, осталось %.2f рад",
+                    w_cmd,
+                    self.state.dead_end_turn_remaining,
+                )
+
+                return {
+                    "v": 0.0,
+                    "w": w_cmd,
+                    "target": (waypoint.x, waypoint.y),
+                    "range_min": self.state.last_range_min,
+                    "yaw_error": None,
+                }
 
             x, y, yaw = self.pose
             dx = waypoint.x - x
@@ -389,7 +476,7 @@ class WaypointNavigator:
                 and abs(yaw_error) <= self.config.dead_end_yaw_threshold
             ):
                 if dead_end_skips < self.config.dead_end_max_skip:
-                    self._skip_dead_end_waypoint(range_min)
+                    self._skip_dead_end_waypoint(range_min, yaw_error, left_min, right_min)
                     dead_end_skips += 1
                     continue
                 self.logger.warning(

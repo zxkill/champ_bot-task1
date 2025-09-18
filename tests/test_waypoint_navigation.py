@@ -29,6 +29,7 @@ def navigator() -> WaypointNavigator:
         forward_clearance_distance=0.4,
         blocked_turn_speed=0.9,
         in_place_turn_threshold=math.radians(25.0),
+        dead_end_distance=0.2,
     )
     return WaypointNavigator(
         waypoints=[Waypoint(1.0, 0.0, 0.6), Waypoint(2.0, 0.0, 0.5)],
@@ -103,6 +104,7 @@ def test_forward_motion_blocked_when_clearance_small(navigator, caplog):
 def test_dead_end_skip_advances_waypoint(navigator):
     """Тупиковый фронт должен заставить навигатор пропустить текущую точку."""
 
+    navigator.config.dead_end_distance = 0.45
     navigator.update_pose(0.0, 0.0, 0.0)
     navigator.update_scan([0.3, 0.3, 0.3, 0.3, 0.3])
     command = navigator.step(0.1)
@@ -112,10 +114,53 @@ def test_dead_end_skip_advances_waypoint(navigator):
     assert command["v"] == pytest.approx(0.0, abs=1e-6)
 
 
+def test_dead_end_forces_half_turn_before_resuming(navigator):
+    """После пропуска тупика робот обязан провернуться примерно на 180° перед движением."""
+
+    navigator.config.dead_end_distance = 0.45
+    navigator.update_pose(0.0, 0.0, 0.0)
+    navigator.update_scan([0.3, 0.3, 0.3, 0.3, 0.3])
+
+    dt = 0.1
+    command = navigator.step(dt)
+
+    assert navigator.state.index == 1
+    assert command["v"] == pytest.approx(0.0, abs=1e-6)
+    assert command["yaw_error"] is None
+    assert abs(command["w"]) == pytest.approx(navigator.config.max_angular_speed)
+
+    turn_direction = math.copysign(1.0, command["w"])
+    total_rotation = abs(command["w"]) * dt
+    yaw = 0.0
+
+    for _ in range(40):
+        if navigator.state.dead_end_turn_remaining <= 1e-6:
+            break
+        yaw += command["w"] * dt
+        navigator.update_pose(0.0, 0.0, yaw)
+        navigator.update_scan([0.8, 0.8, 0.8, 0.8, 0.8])
+        command = navigator.step(dt)
+        total_rotation += abs(command["w"]) * dt
+        assert command["v"] == pytest.approx(0.0, abs=1e-6)
+        assert math.copysign(1.0, command["w"]) == turn_direction
+    else:
+        pytest.fail("Принудительный разворот не завершился вовремя")
+
+    assert total_rotation == pytest.approx(math.pi, rel=0.1)
+    assert navigator.state.dead_end_turn_remaining == pytest.approx(0.0, abs=1e-6)
+    assert navigator.state.dead_end_turn_direction is None
+
+    navigator.update_pose(0.0, 0.0, yaw)
+    navigator.update_scan([1.0, 1.0, 1.0, 1.0, 1.0])
+    resume_command = navigator.step(dt)
+    assert resume_command["yaw_error"] is not None
+
+
 def test_dead_end_skip_respects_limit(navigator):
     """При нулевом лимите пропусков точка не должна перескакиваться автоматически."""
 
     navigator.config.dead_end_max_skip = 0
+    navigator.config.dead_end_distance = 0.45
     navigator.update_pose(0.0, 0.0, 0.0)
     navigator.update_scan([0.35, 0.34, 0.33, 0.34, 0.35])
     command = navigator.step(0.1)
