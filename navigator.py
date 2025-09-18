@@ -43,6 +43,8 @@ class NavigatorConfig:
     slowdown_distance: float = 0.55  # линейная скорость начинает снижаться раньше столкновения
     min_speed: float = 0.05  # нижний предел положительной скорости при движении вперёд
     hard_stop_distance: float = 0.25  # абсолютный порог остановки при опасном сближении
+    forward_clearance_distance: float = 0.35  # минимальный зазор перед роботом для разрешения движения вперёд
+    blocked_turn_speed: float = 1.2  # минимальная |ω|, когда стоим из-за недостаточного зазора
     lidar_fov_deg: float = 45.0  # сектор обзора используемого лидара
     log_level: int = logging.INFO  # отдельный уровень логов навигатора
 
@@ -206,6 +208,7 @@ class WaypointNavigator:
         range_min = math.inf
         avoidance = 0.0
         avoidance_raw = 0.0
+        forward_blocked = False  # флаг: нельзя ехать вперёд из-за тесного прохода
         if self._ranges:
             n = len(self._ranges)
             if n == 1:
@@ -228,6 +231,16 @@ class WaypointNavigator:
                     range_min,
                 )
                 v_cmd = 0.0
+                forward_blocked = True
+            elif range_min < self.config.forward_clearance_distance and v_cmd > 0.0:
+                # Перед роботом недостаточно места, безопаснее остаться на месте и повернуться.
+                v_cmd = 0.0
+                forward_blocked = True
+                self.logger.info(
+                    "Недостаточный зазор спереди: %.2f м < %.2f м — выполняем разворот на месте",
+                    range_min,
+                    self.config.forward_clearance_distance,
+                )
             elif range_min < self.config.slowdown_distance and v_cmd > 0.0:
                 slowdown = max(0.0, min(1.0, range_min / self.config.slowdown_distance))
                 v_cmd = max(self.config.min_speed, v_cmd * slowdown)
@@ -256,6 +269,10 @@ class WaypointNavigator:
         else:
             range_min = math.inf
 
+        if forward_blocked:
+            # Если вперёд идти нельзя, ускоряем поворот, чтобы быстрее освободить себе путь.
+            w_cmd = self._apply_blocked_turn_boost(w_cmd, yaw_error)
+
         self.state.last_range_min = range_min
         self.state.last_command = (v_cmd, w_cmd)
 
@@ -278,3 +295,33 @@ class WaypointNavigator:
             "range_min": range_min,
             "yaw_error": yaw_error,
         }
+
+    def _apply_blocked_turn_boost(self, w_cmd: float, yaw_error: float) -> float:
+        """Увеличивает скорость разворота, когда фронтальный проход перекрыт.
+
+        Метод вынесен отдельно, чтобы его можно было точечно протестировать.
+        Если текущая угловая скорость мала, навигатор подбирает направление
+        разворота: сначала пытается следовать знаку ошибки курса, а когда
+        она равна нулю, выбирает левый поворот как безопасный вариант.
+        После расчёта выполняется жёсткое ограничение по `max_angular_speed`.
+        """
+
+        turn_speed = self.config.blocked_turn_speed
+        if abs(w_cmd) < turn_speed:
+            if w_cmd == 0.0:
+                # Отдаём предпочтение знаку ошибки курса, иначе выбираем разворот влево.
+                if yaw_error != 0.0:
+                    direction_seed = yaw_error
+                else:
+                    direction_seed = 1.0
+            else:
+                direction_seed = w_cmd
+            direction = math.copysign(1.0, direction_seed)
+            boosted = direction * turn_speed
+            self.logger.debug(
+                "Ускоряем разворот до %.2f рад/с из-за блокировки по фронту",
+                boosted,
+            )
+            w_cmd = boosted
+
+        return max(-self.config.max_angular_speed, min(self.config.max_angular_speed, w_cmd))

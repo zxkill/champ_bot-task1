@@ -135,7 +135,11 @@ def main(route: RaceRoute | None = None) -> None:
     route = route or RaceRoute.default()
     navigator = WaypointNavigator(
         waypoints=route.waypoints,
-        config=NavigatorConfig(lidar_fov_deg=LIDAR_FOV),
+        config=NavigatorConfig(
+            lidar_fov_deg=LIDAR_FOV,
+            forward_clearance_distance=0.4,
+            blocked_turn_speed=1.5,
+        ),
         logger=logging.getLogger("navigator"),
     )
 
