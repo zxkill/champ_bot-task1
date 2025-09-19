@@ -1,0 +1,440 @@
+"""Проверки для модуля навигации по опорным точкам."""
+
+import logging
+import math
+import os
+import sys
+
+import pytest
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+from navigator import NavigatorConfig, Waypoint, WaypointNavigator  # noqa: E402
+from race_runner import RaceRoute  # noqa: E402
+
+
+@pytest.fixture()
+def navigator() -> WaypointNavigator:
+    """Создаём навигатор с простым маршрутом из двух точек."""
+
+    cfg = NavigatorConfig(
+        angle_gain=2.5,
+        max_angular_speed=1.5,
+        max_linear_speed=0.8,
+        lidar_fov_deg=45.0,
+        avoidance_distance=0.6,
+        avoidance_gain=1.2,
+        slowdown_distance=0.5,
+        hard_stop_distance=0.22,
+        forward_clearance_distance=0.4,
+        blocked_turn_speed=0.9,
+        in_place_turn_threshold=math.radians(25.0),
+        dead_end_distance=0.2,
+    )
+    return WaypointNavigator(
+        waypoints=[Waypoint(1.0, 0.0, 0.6), Waypoint(2.0, 0.0, 0.5)],
+        config=cfg,
+    )
+
+
+def test_constructor_requires_non_empty_route():
+    """Создание навигатора без точек должно вызывать ошибку."""
+
+    with pytest.raises(ValueError):
+        WaypointNavigator([], NavigatorConfig())
+
+
+def test_set_waypoints_validates_input(navigator):
+    """Пустой список точек при перенастройке также недопустим."""
+
+    with pytest.raises(ValueError):
+        navigator.set_waypoints([])
+
+    # После корректной подстановки маршрут должен обновиться и сбросить индекс.
+    navigator.set_waypoints([Waypoint(0.5, 0.0, 0.3)])
+    assert navigator.state.index == 0
+
+
+def test_rotates_in_place_when_target_behind(navigator):
+    """Если цель находится позади, линейная скорость должна быть нулевой."""
+
+    navigator.update_pose(0.0, 0.0, math.pi)
+    navigator.update_scan([1.0] * 5)
+    command = navigator.step(0.1)
+    assert command["v"] == pytest.approx(0.0, abs=1e-6)
+    assert command["w"] < 0.0  # нужно повернуться вправо, чтобы увидеть цель
+
+
+def test_switches_waypoint_after_reaching_threshold(navigator):
+    """При малом расстоянии до точки навигатор должен перейти к следующей."""
+
+    navigator.update_pose(0.95, 0.0, 0.0)
+    navigator.update_scan([1.0] * 5)
+    first_command = navigator.step(0.1)
+    assert navigator.state.index == 1
+    assert first_command["target"] == pytest.approx((2.0, 0.0))
+
+
+def test_obstacle_forces_slowdown(navigator):
+    """Близкое препятствие должно значительно снижать скорость и менять курс."""
+
+    navigator.update_pose(0.0, 0.0, 0.0)
+    # Спереди препятствие на 0.2 м — гораздо ближе порога замедления.
+    ranges = [0.8, 0.6, 0.2, 0.6, 0.8]
+    navigator.update_scan(ranges)
+    command = navigator.step(0.1)
+    assert command["v"] == pytest.approx(0.0, abs=1e-6)
+    assert abs(command["w"]) > 0.0
+
+
+def test_forward_motion_blocked_when_clearance_small(navigator, caplog):
+    """При малом зазоре спереди движение должно остановиться и включиться активный разворот."""
+
+    navigator.update_pose(0.0, 0.0, 0.0)
+    # Симметричное препятствие прямо перед роботом: избегание не даёт подсказки по направлению.
+    navigator.update_scan([0.5, 0.42, 0.33, 0.42, 0.5])
+    with caplog.at_level("INFO"):
+        command = navigator.step(0.1)
+
+    assert command["v"] == pytest.approx(0.0, abs=1e-6)
+    assert abs(command["w"]) >= navigator.config.blocked_turn_speed
+    assert "Недостаточный зазор спереди" in caplog.text
+
+
+def test_dead_end_skip_advances_waypoint(navigator):
+    """Тупиковый фронт должен заставить навигатор пропустить текущую точку."""
+
+    navigator.config.dead_end_distance = 0.45
+    navigator.update_pose(0.0, 0.0, 0.0)
+    navigator.update_scan([0.3, 0.3, 0.3, 0.3, 0.3])
+    command = navigator.step(0.1)
+
+    assert navigator.state.index == 1
+    assert command["target"] == pytest.approx((2.0, 0.0))
+    assert command["v"] == pytest.approx(0.0, abs=1e-6)
+
+
+def test_dead_end_forces_half_turn_before_resuming(navigator):
+    """После пропуска тупика робот обязан провернуться примерно на 180° перед движением."""
+
+    navigator.config.dead_end_distance = 0.45
+    navigator.update_pose(0.0, 0.0, 0.0)
+    navigator.update_scan([0.3, 0.3, 0.3, 0.3, 0.3])
+
+    dt = 0.1
+    command = navigator.step(dt)
+
+    assert navigator.state.index == 1
+    assert command["v"] == pytest.approx(0.0, abs=1e-6)
+    assert command["yaw_error"] is None
+    assert abs(command["w"]) == pytest.approx(navigator.config.max_angular_speed)
+
+    turn_direction = math.copysign(1.0, command["w"])
+    total_rotation = abs(command["w"]) * dt
+    yaw = 0.0
+
+    for _ in range(40):
+        if navigator.state.dead_end_turn_remaining <= 1e-6:
+            break
+        yaw += command["w"] * dt
+        navigator.update_pose(0.0, 0.0, yaw)
+        navigator.update_scan([0.8, 0.8, 0.8, 0.8, 0.8])
+        command = navigator.step(dt)
+        total_rotation += abs(command["w"]) * dt
+        assert command["v"] == pytest.approx(0.0, abs=1e-6)
+        assert math.copysign(1.0, command["w"]) == turn_direction
+    else:
+        pytest.fail("Принудительный разворот не завершился вовремя")
+
+    assert total_rotation == pytest.approx(math.pi, rel=0.1)
+    assert navigator.state.dead_end_turn_remaining == pytest.approx(0.0, abs=1e-6)
+    assert navigator.state.dead_end_turn_direction is None
+
+    navigator.update_pose(0.0, 0.0, yaw)
+    navigator.update_scan([1.0, 1.0, 1.0, 1.0, 1.0])
+    resume_command = navigator.step(dt)
+    assert resume_command["yaw_error"] is not None
+
+
+def test_dead_end_skip_respects_limit(navigator):
+    """При нулевом лимите пропусков точка не должна перескакиваться автоматически."""
+
+    navigator.config.dead_end_max_skip = 0
+    navigator.config.dead_end_distance = 0.45
+    navigator.update_pose(0.0, 0.0, 0.0)
+    navigator.update_scan([0.35, 0.34, 0.33, 0.34, 0.35])
+    command = navigator.step(0.1)
+
+    assert navigator.state.index == 0
+    assert command["target"] == pytest.approx((1.0, 0.0))
+
+
+def test_update_unwrapped_yaw_wraps_positive_delta(navigator):
+    """Переход через +pi должен корректно уменьшать прирост угла."""
+
+    navigator.state.prev_yaw = -3.0
+    navigator.state.yaw_unwrapped = -3.0
+    navigator._update_unwrapped_yaw(3.0)
+
+    expected = -3.0 + (3.0 - (-3.0) - 2 * math.pi)
+    assert navigator.state.yaw_unwrapped == pytest.approx(expected)
+
+
+def test_update_unwrapped_yaw_wraps_negative_delta(navigator):
+    """Переход через -pi также должен корректно добавлять 2*pi."""
+
+    navigator.state.prev_yaw = 3.0
+    navigator.state.yaw_unwrapped = 3.0
+    navigator._update_unwrapped_yaw(-3.0)
+
+    expected = 3.0 + (-3.0 - 3.0 + 2 * math.pi)
+    assert navigator.state.yaw_unwrapped == pytest.approx(expected)
+
+
+def test_blocked_rotation_tracker_initializes_missing_yaw(navigator):
+    """Если счётчик потерян, метод обязан восстановить базу и остановиться."""
+
+    navigator.state.blocked_yaw_last = None
+    navigator.state.yaw_unwrapped = 1.5
+    navigator.state.blocked_rotation_accum = 1.0
+    navigator._update_blocked_rotation_tracker(entering=False)
+
+    assert navigator.state.blocked_yaw_last == pytest.approx(1.5)
+    assert navigator.state.blocked_rotation_accum == pytest.approx(1.0)
+
+
+def test_release_without_ranges_logs_info(navigator, caplog):
+    """Отсутствие данных лидара должно приводить к мягкому снятию блокировки."""
+
+    navigator.config.dead_end_distance = 0.2
+    navigator.update_pose(0.0, 0.0, 0.0)
+    navigator.update_scan([0.35, 0.34, 0.33, 0.34, 0.35])
+    navigator.step(0.1)
+
+    navigator.update_scan([])
+    with caplog.at_level("INFO"):
+        command = navigator.step(0.1)
+
+    assert command["target"] == pytest.approx((1.0, 0.0))
+    assert "Снимаем блокировку без данных лидара" in caplog.text
+
+
+def test_blocked_turn_follows_fixed_direction(navigator):
+    """При симметричных данных лидар робот обязан крутиться в заданную сторону."""
+
+    navigator.config.scan_fixed_direction = 1.0
+    navigator.update_pose(0.0, 0.0, -0.2)
+    navigator.update_scan([0.35, 0.34, 0.33, 0.34, 0.35])
+
+    command = navigator.step(0.1)
+
+    assert command["v"] == pytest.approx(0.0, abs=1e-6)
+    assert command["w"] > 0.0
+
+
+def test_blocked_turn_follows_yaw_without_fixed(navigator):
+    """Когда фиксированного направления нет, навигатор обязан поддерживать знак yaw_error."""
+
+    navigator.config.scan_fixed_direction = None
+    navigator.update_pose(0.0, 0.0, 0.5)
+    navigator.update_scan([0.34, 0.33, 0.32, 0.33, 0.34])
+
+    command = navigator.step(0.1)
+
+    assert command["v"] == pytest.approx(0.0, abs=1e-6)
+    assert command["w"] < 0.0
+
+
+def test_blocked_turn_boosts_existing_rotation(navigator):
+    """При малом ненулевом повороте boosting должен сохранить знак и поднять скорость до порога."""
+
+    navigator.update_pose(0.0, 0.0, -0.1)
+    navigator.update_scan([0.5, 0.42, 0.33, 0.42, 0.5])
+
+    command = navigator.step(0.1)
+
+    assert command["v"] == pytest.approx(0.0, abs=1e-6)
+    assert command["w"] == pytest.approx(navigator.config.blocked_turn_speed)
+
+
+def test_apply_blocked_turn_boost_prefers_yaw_error(navigator):
+    """Отдельный метод должен корректно выбирать направление разворота."""
+
+    result = navigator._apply_blocked_turn_boost(0.0, -0.4)
+    assert result == pytest.approx(-navigator.config.blocked_turn_speed)
+
+    result_left = navigator._apply_blocked_turn_boost(0.0, 0.0)
+    assert result_left == pytest.approx(navigator.config.blocked_turn_speed)
+
+
+def test_blocked_scan_full_rotation_stops(navigator, caplog):
+    """После полного оборота без коридора команды должны замереть."""
+
+    navigator.config.scan_full_rotation = math.radians(10.0)
+    navigator.update_pose(0.0, 0.0, 0.0)
+    navigator.update_scan([0.32, 0.31, 0.3, 0.31, 0.32])
+    navigator.step(0.1)
+
+    navigator.update_pose(0.0, 0.0, math.radians(6.0))
+    navigator.update_scan([0.32, 0.31, 0.3, 0.31, 0.32])
+    navigator.step(0.1)
+
+    navigator.update_pose(0.0, 0.0, math.radians(12.0))
+    navigator.update_scan([0.32, 0.31, 0.3, 0.31, 0.32])
+    with caplog.at_level(logging.ERROR):
+        command = navigator.step(0.1)
+
+    assert command["v"] == pytest.approx(0.0, abs=1e-6)
+    assert command["w"] == pytest.approx(0.0, abs=1e-6)
+    assert navigator.state.blocked_scan_failed is True
+    assert "Полный круг" in caplog.text
+
+
+def test_blocked_scan_recovers_after_clearance(navigator):
+    """Как только коридор найден, все счётчики блокировки должны сбрасываться."""
+
+    navigator.config.scan_full_rotation = math.radians(10.0)
+    navigator.update_pose(0.0, 0.0, 0.0)
+    navigator.update_scan([0.32, 0.31, 0.3, 0.31, 0.32])
+    navigator.step(0.1)
+    navigator.update_pose(0.0, 0.0, math.radians(12.0))
+    navigator.update_scan([0.32, 0.31, 0.3, 0.31, 0.32])
+    navigator.step(0.1)
+
+    navigator.update_scan([1.2, 1.2, 1.2, 1.2, 1.2])
+    navigator.update_pose(0.0, 0.0, 0.0)
+    command = navigator.step(0.1)
+
+    assert command["v"] >= 0.0
+    assert navigator.state.blocked_steps == 0
+    assert navigator.state.blocked_turn_direction is None
+    assert navigator.state.blocked_scan_failed is False
+
+
+def test_blocked_direction_waits_for_release_margin(navigator):
+    """Гистерезис по дистанции должен удерживать вращение, пока запаса недостаточно."""
+
+    navigator.config.clearance_release_margin = 0.2
+    navigator.update_pose(0.0, 0.0, 0.0)
+    navigator.update_scan([0.38, 0.36, 0.33, 0.36, 0.38])
+    first_command = navigator.step(0.1)
+    assert first_command["v"] == pytest.approx(0.0, abs=1e-6)
+
+    navigator.update_scan([0.5, 0.48, 0.46, 0.48, 0.5])
+    second_command = navigator.step(0.1)
+    assert second_command["v"] == pytest.approx(0.0, abs=1e-6)
+
+    navigator.update_scan([0.9, 0.9, 0.9, 0.9, 0.9])
+    release_command = navigator.step(0.1)
+    assert release_command["v"] >= 0.0
+
+
+def test_scan_direction_configurable(navigator):
+    """Смена знака конфигурации должна разворачивать робот вправо."""
+
+    navigator.config.scan_fixed_direction = -1.0
+    navigator.update_pose(0.0, 0.0, 0.0)
+    navigator.update_scan([0.34, 0.33, 0.32, 0.33, 0.34])
+    command = navigator.step(0.1)
+
+    assert command["w"] < 0.0
+
+
+def test_resolve_blocked_turn_direction_without_fixed(navigator):
+    """Когда фиксированного направления нет, метод должен полагаться на данные лидара."""
+
+    navigator.config.scan_fixed_direction = None
+    navigator.state.blocked_steps = 1
+    navigator.state.blocked_turn_direction = None
+    decision = navigator._resolve_blocked_turn_direction(0.0, 0.0, 0.8, 0.3)
+    assert decision > 0.0
+
+    navigator.state.blocked_steps = 2
+    navigator.state.blocked_turn_direction = None
+    decision_right = navigator._resolve_blocked_turn_direction(0.0, 0.0, 0.3, 0.8)
+    assert decision_right < 0.0
+
+
+def test_apply_blocked_turn_boost_respects_max_speed(navigator):
+    """Когда угловая скорость уже велика, boosting должен ограничить её максимумом."""
+
+    boosted = navigator._apply_blocked_turn_boost(2.0, 0.0)
+    assert boosted == pytest.approx(navigator.config.max_angular_speed)
+
+
+def test_slowdown_region_between_stop_and_clear(navigator):
+    """Если препятствие чуть дальше порога остановки, включаем плавное замедление."""
+
+    navigator.update_pose(0.0, 0.0, 0.0)
+    navigator.update_scan([0.55, 0.48, 0.45, 0.48, 0.55])
+    command = navigator.step(0.1)
+    assert command["v"] > 0.0
+    assert command["v"] < navigator.config.max_linear_speed
+
+
+def test_avoidance_cannot_flip_turn_direction(navigator):
+    """Когда нужно резко развернуться, добавка избегания не должна разворачивать робот."""
+
+    # Немного разворачиваем робота так, чтобы yaw_error был около -0.3 рад (цель справа позади).
+    navigator.update_pose(0.0, 0.0, 0.3)
+    # Уменьшаем требуемый зазор, чтобы навигатор не блокировал движение и применил ограничение знака.
+    navigator.config.forward_clearance_distance = 0.2
+    # Справа (углы < 0) располагаются препятствия на расстоянии 0.25 м,
+    # что пытается сместить поворот влево. Проверяем, что ограничение сохраняет знак ω.
+    navigator.update_scan([0.25, 0.25, 0.7, 0.7, 0.7])
+    command = navigator.step(0.1)
+    assert command["w"] < 0.0
+
+
+def test_refuses_non_positive_dt(navigator):
+    """Нулевой шаг интегрирования должен приводить к ошибке."""
+
+    navigator.update_pose(0.0, 0.0, 0.0)
+    navigator.update_scan([1.0] * 5)
+    with pytest.raises(ValueError):
+        navigator.step(0.0)
+
+
+def test_handles_empty_scan_and_finishes_route(navigator):
+    """Навигатор должен останавливаться, если лидар не дал данных или маршрут завершён."""
+
+    navigator.update_scan([float("nan"), -1.0])
+    navigator.update_pose(0.0, 0.0, 0.0)
+    cmd_turn = navigator.step(0.1)
+    assert cmd_turn["v"] == 0.0
+
+    # Последовательно закрываем обе точки маршрута.
+    navigator.update_scan([1.0])  # одиночный луч покрывает ветку n == 1
+    navigator.update_pose(1.0, 0.0, 0.0)
+    navigator.step(0.1)
+
+    navigator.update_pose(2.0, 0.0, 0.0)
+    command = navigator.step(0.1)
+    assert command["target"] is None
+    assert navigator.state.finished is True
+
+    repeat = navigator.step(0.1)
+    assert repeat["target"] is None
+
+
+def test_race_route_contains_dense_waypoints():
+    """Гоночный маршрут должен состоять из плотной сетки точек без резких скачков."""
+
+    route = RaceRoute.default()
+    # Проверяем, что путь содержит достаточно опорных точек, чтобы робот не пытался угадывать проходы.
+    assert len(route.waypoints) >= 24
+
+    # Дополнительно убеждаемся, что расстояние между соседними точками не превышает 1.6 м,
+    # что гарантирует плавное движение и корректную работу регуляторов в дверном проёме.
+    previous = route.waypoints[0]
+    for current in route.waypoints[1:]:
+        delta = math.hypot(current.x - previous.x, current.y - previous.y)
+        assert delta <= 1.6
+        previous = current
+
+    # Финальная точка должна находиться на белом прямоугольнике и требовать снижения скорости.
+    final_wp = route.waypoints[-1]
+    assert final_wp.x <= 1.0
+    assert final_wp.y >= 0.3
+    assert final_wp.speed <= 0.25
+
